@@ -32,6 +32,7 @@ typedef struct
 {
     bool running;
     int listen_fd;
+    uint64_t uptime_ms;
     net_server_config_t config;
     net_client_t clients[SERVER_MAX_PLAYERS];
     TaskHandle_t task;
@@ -45,7 +46,9 @@ static int count_online_players(const net_server_state_t *server)
     int count = 0;
     for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
     {
-        if (server->clients[i].in_use)
+        if (server->clients[i].in_use &&
+            server->clients[i].protocol.state == PROTO_STATE_PLAY &&
+            server->clients[i].protocol.joined_play)
         {
             count++;
         }
@@ -100,6 +103,43 @@ static void close_client(net_client_t *client)
     memset(client, 0, sizeof(*client));
 }
 
+static bool socket_broadcast_except(void *context,
+                                    int source_socket_fd,
+                                    const uint8_t *data,
+                                    size_t length)
+{
+    net_server_state_t *server = (net_server_state_t *)context;
+    bool all_sent = true;
+
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *client = &server->clients[i];
+        if (!client->in_use ||
+            client->socket_fd == source_socket_fd ||
+            client->protocol.state != PROTO_STATE_PLAY ||
+            !client->protocol.joined_play)
+        {
+            continue;
+        }
+
+        if (!socket_send_all(server, client->socket_fd, data, length))
+        {
+            close_client(client);
+            all_sent = false;
+        }
+    }
+
+    return all_sent;
+}
+
+static void fill_server_info(const net_server_state_t *server, proto_server_info_t *server_info)
+{
+    server_info->protocol_version = server->config.protocol_version;
+    server_info->max_players = server->config.max_players;
+    server_info->online_players = (uint8_t)count_online_players(server);
+    snprintf(server_info->motd, sizeof(server_info->motd), "%s", server->config.motd);
+}
+
 static void accept_new_clients(net_server_state_t *server)
 {
     while (true)
@@ -148,7 +188,7 @@ static void accept_new_clients(net_server_state_t *server)
     }
 }
 
-static void process_stream_packets(net_server_state_t *server, net_client_t *client)
+static void process_stream_packets(net_server_state_t *server, net_client_t *client, uint64_t now_ms)
 {
     uint8_t packet[SERVER_MAX_PACKET_SIZE];
     size_t packet_length = 0;
@@ -173,12 +213,8 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
             return;
         }
 
-        proto_server_info_t server_info = {
-            .protocol_version = server->config.protocol_version,
-            .max_players = server->config.max_players,
-            .online_players = (uint8_t)count_online_players(server),
-        };
-        snprintf(server_info.motd, sizeof(server_info.motd), "%s", server->config.motd);
+        proto_server_info_t server_info;
+        fill_server_info(server, &server_info);
 
         proto_handle_packet(&client->protocol,
                             packet,
@@ -186,7 +222,9 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
                             client->socket_fd,
                             &server_info,
                             socket_send_all,
-                            server);
+                            socket_broadcast_except,
+                            server,
+                            now_ms);
 
         if (client->protocol.close_requested)
         {
@@ -196,7 +234,7 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
     }
 }
 
-static void process_client_rx(net_server_state_t *server, net_client_t *client)
+static void process_client_rx(net_server_state_t *server, net_client_t *client, uint64_t now_ms)
 {
     uint8_t rx_tmp[512];
 
@@ -215,7 +253,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client)
 
             memcpy(client->stream_buffer + client->stream_length, rx_tmp, incoming);
             client->stream_length += incoming;
-            process_stream_packets(server, client);
+            process_stream_packets(server, client, now_ms);
             continue;
         }
 
@@ -291,15 +329,39 @@ static void server_task(void *arg)
 
     while (server->running)
     {
+        uint64_t now_ms = server->uptime_ms;
+
         accept_new_clients(server);
 
         for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
         {
             if (server->clients[i].in_use)
             {
-                process_client_rx(server, &server->clients[i]);
+                process_client_rx(server, &server->clients[i], now_ms);
             }
         }
+
+        proto_server_info_t server_info;
+        fill_server_info(server, &server_info);
+        for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+        {
+            if (server->clients[i].in_use)
+            {
+                proto_tick_connection(&server->clients[i].protocol,
+                                      server->clients[i].socket_fd,
+                                      &server_info,
+                                      socket_send_all,
+                                      server,
+                                      now_ms);
+
+                if (server->clients[i].protocol.close_requested)
+                {
+                    close_client(&server->clients[i]);
+                }
+            }
+        }
+
+        server->uptime_ms += SERVER_TICK_MS;
 
         vTaskDelay(pdMS_TO_TICKS(SERVER_TICK_MS));
     }
