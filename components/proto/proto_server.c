@@ -363,7 +363,8 @@ static bool write_plains_biome_registry_entry(proto_writer_t *writer)
     return nbt_write_named_string(writer, "name", "minecraft:plains") &&
            nbt_write_named_int(writer, "id", 1) &&
            nbt_begin_named_compound(writer, "element") &&
-           write_plains_biome_element_compound(writer);
+           write_plains_biome_element_compound(writer) &&
+           nbt_end_compound(writer);
 }
 
 static bool write_overworld_dimension_fields(proto_writer_t *writer)
@@ -389,6 +390,7 @@ static bool write_overworld_dimension_registry_entry(proto_writer_t *writer)
            nbt_write_named_int(writer, "id", 0) &&
            nbt_begin_named_compound(writer, "element") &&
            write_overworld_dimension_fields(writer) &&
+           nbt_end_compound(writer) &&
            nbt_end_compound(writer);
 }
 
