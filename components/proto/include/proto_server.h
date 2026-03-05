@@ -70,3 +70,10 @@ void proto_tick_connection(proto_connection_t *connection,
                            proto_send_callback_t send_fn,
                            void *send_context,
                            uint64_t now_ms);
+
+bool proto_build_chat_packet(const char *message_text,
+                             int64_t uuid_most,
+                             int64_t uuid_least,
+                             uint8_t *framed_packet_out,
+                             size_t framed_packet_capacity,
+                             size_t *framed_packet_length);

@@ -683,6 +683,33 @@ static bool build_chat_packet_body(const char *message_text,
     return true;
 }
 
+bool proto_build_chat_packet(const char *message_text,
+                             int64_t uuid_most,
+                             int64_t uuid_least,
+                             uint8_t *framed_packet_out,
+                             size_t framed_packet_capacity,
+                             size_t *framed_packet_length)
+{
+    uint8_t packet_body[SERVER_MAX_PACKET_SIZE];
+    size_t packet_body_length = 0;
+
+    if (!build_chat_packet_body(message_text,
+                                uuid_most,
+                                uuid_least,
+                                packet_body,
+                                sizeof(packet_body),
+                                &packet_body_length))
+    {
+        return false;
+    }
+
+    return proto_wrap_packet(packet_body,
+                             packet_body_length,
+                             framed_packet_out,
+                             framed_packet_capacity,
+                             framed_packet_length);
+}
+
 static bool send_chat_text_to_client(int socket_fd,
                                      const char *message_text,
                                      int64_t uuid_most,

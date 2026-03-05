@@ -381,6 +381,72 @@ static void server_task(void *arg)
     vTaskDelete(NULL);
 }
 
+bool net_server_is_running(void)
+{
+    return s_server.running;
+}
+
+uint8_t net_server_online_players(void)
+{
+    return (uint8_t)count_online_players(&s_server);
+}
+
+esp_err_t net_server_broadcast_chat(const char *message)
+{
+    if (message == NULL || message[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_server.running)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t framed_packet[SERVER_MAX_PACKET_SIZE + 8];
+    size_t framed_packet_length = 0;
+    if (!proto_build_chat_packet(message,
+                                 0,
+                                 0,
+                                 framed_packet,
+                                 sizeof(framed_packet),
+                                 &framed_packet_length))
+    {
+        return ESP_FAIL;
+    }
+
+    bool any_client = false;
+    bool delivered = false;
+
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *client = &s_server.clients[i];
+        if (!client->in_use ||
+            client->protocol.state != PROTO_STATE_PLAY ||
+            !client->protocol.joined_play)
+        {
+            continue;
+        }
+
+        any_client = true;
+        if (socket_send_all(&s_server, client->socket_fd, framed_packet, framed_packet_length))
+        {
+            delivered = true;
+        }
+        else
+        {
+            close_client(client);
+        }
+    }
+
+    if (!any_client)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return delivered ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t net_server_start(const net_server_config_t *config)
 {
     if (config == NULL)

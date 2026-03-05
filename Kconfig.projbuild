@@ -1,0 +1,17 @@
+menu "Macerun Configuration"
+
+config MACERUN_STA_SSID
+    string "Primary STA SSID"
+    default ""
+    help
+        Primary Wi-Fi SSID for STA-first startup.
+        Keep this in local sdkconfig (which is gitignored).
+
+config MACERUN_STA_PASSWORD
+    string "Primary STA Password"
+    default ""
+    help
+        Primary Wi-Fi password for STA-first startup.
+        Keep this in local sdkconfig (which is gitignored).
+
+endmenu
