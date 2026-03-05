@@ -79,14 +79,41 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
     (void)context;
 
     size_t sent = 0;
+    uint32_t stalled_retries = 0;
+
     while (sent < length)
     {
         ssize_t result = send(socket_fd, data + sent, length - sent, 0);
-        if (result <= 0)
+        if (result > 0)
+        {
+            sent += (size_t)result;
+            stalled_retries = 0;
+            continue;
+        }
+
+        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            stalled_retries++;
+            if (stalled_retries > SERVER_SOCKET_SEND_STALL_RETRIES)
+            {
+                return false;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        if (result < 0 && errno == EINTR)
+        {
+            continue;
+        }
+
+        if (result == 0)
         {
             return false;
         }
-        sent += (size_t)result;
+
+        return false;
     }
 
     return true;
@@ -190,7 +217,7 @@ static void accept_new_clients(net_server_state_t *server)
 
 static void process_stream_packets(net_server_state_t *server, net_client_t *client, uint64_t now_ms)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
+    uint8_t packet[SERVER_MAX_INBOUND_PACKET_SIZE];
     size_t packet_length = 0;
 
     while (client->in_use)
@@ -403,7 +430,7 @@ esp_err_t net_server_broadcast_chat(const char *message)
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t framed_packet[SERVER_MAX_PACKET_SIZE + 8];
+    uint8_t framed_packet[SERVER_MAX_INBOUND_PACKET_SIZE + 8];
     size_t framed_packet_length = 0;
     if (!proto_build_chat_packet(message,
                                  0,

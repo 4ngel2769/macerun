@@ -1,11 +1,14 @@
 #include "proto_server.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "proto_framing.h"
 #include "server_limits.h"
+#include "block_deltas.h"
+#include "world_query.h"
 
 #define PROTO_KEEPALIVE_INTERVAL_MS 5000ULL
 #define PROTO_KEEPALIVE_TIMEOUT_MS 15000ULL
@@ -21,9 +24,52 @@ typedef enum
     NBT_TAG_STRING = 8,
     NBT_TAG_LIST = 9,
     NBT_TAG_COMPOUND = 10,
+    NBT_TAG_LONG_ARRAY = 12,
 } nbt_tag_t;
 
+#define PROTO_SECTION_WIDTH 16
+#define PROTO_SECTION_HEIGHT 16
+#define PROTO_SECTION_VOLUME (PROTO_SECTION_WIDTH * PROTO_SECTION_WIDTH * PROTO_SECTION_HEIGHT)
+#define PROTO_SECTION_COUNT 16
+#define PROTO_LIGHT_SECTION_COUNT (PROTO_SECTION_COUNT + 2)
+#define PROTO_HEIGHTMAP_ENTRY_COUNT 256
+#define PROTO_HEIGHTMAP_BITS_PER_ENTRY 9
+#define PROTO_HEIGHTMAP_LONG_COUNT 36
+#define PROTO_BIOME_ARRAY_COUNT (4 * 4 * 64)
+#define PROTO_CHUNK_LIGHT_EMPTY_MASK ((1 << PROTO_LIGHT_SECTION_COUNT) - 1)
+
 static int32_t s_next_entity_id = 1;
+static bool s_world_initialized = false;
+static world_config_t s_world_config;
+static world_deltas_t s_world_deltas;
+
+static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
+static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
+static uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
+
+static bool send_packet(int socket_fd,
+                        const uint8_t *packet_body,
+                        size_t packet_length,
+                        proto_send_callback_t send_fn,
+                        void *send_context);
+
+static bool broadcast_packet(int source_socket_fd,
+                             const uint8_t *packet_body,
+                             size_t packet_length,
+                             proto_broadcast_callback_t broadcast_fn,
+                             void *send_context);
+
+static void ensure_world_initialized(void)
+{
+    if (s_world_initialized)
+    {
+        return;
+    }
+
+    world_config_set_defaults(&s_world_config, WORLD_SEED_DEFAULT);
+    world_deltas_init(&s_world_deltas);
+    s_world_initialized = true;
+}
 
 static bool write_i32_be(proto_writer_t *writer, int32_t value)
 {
@@ -325,6 +371,300 @@ static bool nbt_write_named_string(proto_writer_t *writer, const char *name, con
            nbt_write_string(writer, value);
 }
 
+static bool nbt_write_named_long_array(proto_writer_t *writer,
+                                       const char *name,
+                                       const int64_t *values,
+                                       int32_t count)
+{
+    if (count < 0)
+    {
+        return false;
+    }
+
+    if (!nbt_write_named_header(writer, NBT_TAG_LONG_ARRAY, name) ||
+        !write_i32_be(writer, count))
+    {
+        return false;
+    }
+
+    for (int32_t i = 0; i < count; i++)
+    {
+        if (!proto_write_i64_be(writer, values[i]))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int32_t world_block_to_state_id(uint8_t block_id)
+{
+    return block_id == BLOCK_AIR ? 0 : 1;
+}
+
+static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
+{
+    ensure_world_initialized();
+
+    uint8_t block_id = 0;
+    if (world_deltas_get(&s_world_deltas, x, y, z, &block_id))
+    {
+        return world_block_to_state_id(block_id);
+    }
+
+    block_id = world_query_block(&s_world_config, x, y, z);
+    return world_block_to_state_id(block_id);
+}
+
+static void fill_height_samples(int32_t chunk_x,
+                                int32_t chunk_z,
+                                uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT])
+{
+    ensure_world_initialized();
+
+    int32_t max_scan_y = s_world_config.max_y;
+    if (max_scan_y > 255)
+    {
+        max_scan_y = 255;
+    }
+
+    for (int32_t z = 0; z < PROTO_SECTION_WIDTH; z++)
+    {
+        for (int32_t x = 0; x < PROTO_SECTION_WIDTH; x++)
+        {
+            int32_t world_x = (chunk_x << 4) + x;
+            int32_t world_z = (chunk_z << 4) + z;
+            uint16_t height = 0;
+
+            for (int32_t y = max_scan_y; y >= s_world_config.min_y; y--)
+            {
+                if (query_block_state_id(world_x, y, world_z) != 0)
+                {
+                    height = (uint16_t)(y + 1);
+                    break;
+                }
+            }
+
+            height_samples[(z * PROTO_SECTION_WIDTH) + x] = height;
+        }
+    }
+}
+
+static void pack_heightmap(const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT],
+                           uint64_t packed_heightmap[PROTO_HEIGHTMAP_LONG_COUNT])
+{
+    memset(packed_heightmap, 0, sizeof(uint64_t) * PROTO_HEIGHTMAP_LONG_COUNT);
+
+    for (int32_t index = 0; index < PROTO_HEIGHTMAP_ENTRY_COUNT; index++)
+    {
+        uint64_t value = (uint64_t)(height_samples[index] & 0x1FFu);
+        int32_t bit_index = index * PROTO_HEIGHTMAP_BITS_PER_ENTRY;
+        int32_t long_index = bit_index / 64;
+        int32_t bit_offset = bit_index % 64;
+
+        packed_heightmap[long_index] |= value << bit_offset;
+        if (bit_offset > (64 - PROTO_HEIGHTMAP_BITS_PER_ENTRY) && (long_index + 1) < PROTO_HEIGHTMAP_LONG_COUNT)
+        {
+            packed_heightmap[long_index + 1] |= value >> (64 - bit_offset);
+        }
+    }
+}
+
+static bool write_chunk_heightmaps_nbt(proto_writer_t *writer,
+                                       const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT])
+{
+    uint64_t packed_unsigned[PROTO_HEIGHTMAP_LONG_COUNT];
+    int64_t packed_signed[PROTO_HEIGHTMAP_LONG_COUNT];
+
+    pack_heightmap(height_samples, packed_unsigned);
+    for (size_t i = 0; i < PROTO_HEIGHTMAP_LONG_COUNT; i++)
+    {
+        packed_signed[i] = (int64_t)packed_unsigned[i];
+    }
+
+    return nbt_begin_named_compound(writer, "") &&
+           nbt_write_named_long_array(writer,
+                                      "MOTION_BLOCKING",
+                                      packed_signed,
+                                      PROTO_HEIGHTMAP_LONG_COUNT) &&
+           nbt_write_named_long_array(writer,
+                                      "WORLD_SURFACE",
+                                      packed_signed,
+                                      PROTO_HEIGHTMAP_LONG_COUNT) &&
+           nbt_end_compound(writer);
+}
+
+static bool encode_chunk_sections(int32_t chunk_x,
+                                  int32_t chunk_z,
+                                  int32_t *section_mask_out,
+                                  size_t *chunk_data_length_out)
+{
+    proto_writer_t chunk_writer;
+    proto_writer_init(&chunk_writer, s_proto_chunk_data_buffer, sizeof(s_proto_chunk_data_buffer));
+
+    int32_t section_mask = 0;
+
+    for (int32_t section_index = 0; section_index < PROTO_SECTION_COUNT; section_index++)
+    {
+        int32_t section_base_y = section_index * PROTO_SECTION_HEIGHT;
+        int32_t solid_block_count = 0;
+
+        for (int32_t local_y = 0; local_y < PROTO_SECTION_HEIGHT; local_y++)
+        {
+            for (int32_t local_z = 0; local_z < PROTO_SECTION_WIDTH; local_z++)
+            {
+                for (int32_t local_x = 0; local_x < PROTO_SECTION_WIDTH; local_x++)
+                {
+                    int32_t world_x = (chunk_x << 4) + local_x;
+                    int32_t world_y = section_base_y + local_y;
+                    int32_t world_z = (chunk_z << 4) + local_z;
+                    if (query_block_state_id(world_x, world_y, world_z) != 0)
+                    {
+                        solid_block_count++;
+                    }
+                }
+            }
+        }
+
+        if (solid_block_count == 0)
+        {
+            continue;
+        }
+
+        section_mask |= (1 << section_index);
+
+        if (!proto_write_u16_be(&chunk_writer, (uint16_t)solid_block_count) ||
+            !proto_write_u8(&chunk_writer, 4) ||
+            !proto_write_varint(&chunk_writer, 2) ||
+            !proto_write_varint(&chunk_writer, 0) ||
+            !proto_write_varint(&chunk_writer, 1) ||
+            !proto_write_varint(&chunk_writer, PROTO_SECTION_VOLUME / 16))
+        {
+            return false;
+        }
+
+        for (int32_t long_index = 0; long_index < (PROTO_SECTION_VOLUME / 16); long_index++)
+        {
+            uint64_t packed = 0;
+            for (int32_t value_index = 0; value_index < 16; value_index++)
+            {
+                int32_t block_index = (long_index * 16) + value_index;
+                int32_t local_x = block_index & 0x0F;
+                int32_t local_z = (block_index >> 4) & 0x0F;
+                int32_t local_y = (block_index >> 8) & 0x0F;
+
+                int32_t world_x = (chunk_x << 4) + local_x;
+                int32_t world_y = section_base_y + local_y;
+                int32_t world_z = (chunk_z << 4) + local_z;
+
+                uint64_t palette_index = query_block_state_id(world_x, world_y, world_z) == 0 ? 0u : 1u;
+                packed |= palette_index << (value_index * 4);
+            }
+
+            if (!proto_write_i64_be(&chunk_writer, (int64_t)packed))
+            {
+                return false;
+            }
+        }
+    }
+
+    *section_mask_out = section_mask;
+    *chunk_data_length_out = chunk_writer.length;
+    return true;
+}
+
+static bool send_update_view_position_packet(int socket_fd,
+                                             int32_t chunk_x,
+                                             int32_t chunk_z,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x40) ||
+        !proto_write_varint(&writer, chunk_x) ||
+        !proto_write_varint(&writer, chunk_z))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_map_chunk_packet(int socket_fd,
+                                  int32_t chunk_x,
+                                  int32_t chunk_z,
+                                  proto_send_callback_t send_fn,
+                                  void *send_context)
+{
+    uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT];
+    fill_height_samples(chunk_x, chunk_z, height_samples);
+
+    int32_t section_mask = 0;
+    size_t chunk_data_length = 0;
+    if (!encode_chunk_sections(chunk_x, chunk_z, &section_mask, &chunk_data_length))
+    {
+        return false;
+    }
+
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x20) ||
+        !write_i32_be(&writer, chunk_x) ||
+        !write_i32_be(&writer, chunk_z) ||
+        !proto_write_u8(&writer, 1) ||
+        !proto_write_varint(&writer, section_mask) ||
+        !write_chunk_heightmaps_nbt(&writer, height_samples) ||
+        !proto_write_varint(&writer, PROTO_BIOME_ARRAY_COUNT))
+    {
+        return false;
+    }
+
+    for (int32_t i = 0; i < PROTO_BIOME_ARRAY_COUNT; i++)
+    {
+        if (!proto_write_varint(&writer, 1))
+        {
+            return false;
+        }
+    }
+
+    if (!proto_write_varint(&writer, (int32_t)chunk_data_length) ||
+        !proto_write_bytes(&writer, s_proto_chunk_data_buffer, chunk_data_length) ||
+        !proto_write_varint(&writer, 0))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_update_light_packet(int socket_fd,
+                                     int32_t chunk_x,
+                                     int32_t chunk_z,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x23) ||
+        !proto_write_varint(&writer, chunk_x) ||
+        !proto_write_varint(&writer, chunk_z) ||
+        !proto_write_u8(&writer, 1) ||
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
 static bool write_mood_sound_compound(proto_writer_t *writer)
 {
     return nbt_write_named_double(writer, "offset", 2.0) &&
@@ -423,15 +763,23 @@ static bool send_packet(int socket_fd,
                         proto_send_callback_t send_fn,
                         void *send_context)
 {
-    uint8_t framed[SERVER_MAX_PACKET_SIZE + 8];
     size_t framed_length = 0;
 
-    if (!proto_wrap_packet(packet_body, packet_length, framed, sizeof(framed), &framed_length))
+    if (packet_length > SERVER_MAX_OUTBOUND_PACKET_SIZE)
     {
         return false;
     }
 
-    return send_fn(send_context, socket_fd, framed, framed_length);
+    if (!proto_wrap_packet(packet_body,
+                           packet_length,
+                           s_proto_framed_buffer,
+                           sizeof(s_proto_framed_buffer),
+                           &framed_length))
+    {
+        return false;
+    }
+
+    return send_fn(send_context, socket_fd, s_proto_framed_buffer, framed_length);
 }
 
 static bool broadcast_packet(int source_socket_fd,
@@ -445,15 +793,23 @@ static bool broadcast_packet(int source_socket_fd,
         return true;
     }
 
-    uint8_t framed[SERVER_MAX_PACKET_SIZE + 8];
     size_t framed_length = 0;
 
-    if (!proto_wrap_packet(packet_body, packet_length, framed, sizeof(framed), &framed_length))
+    if (packet_length > SERVER_MAX_OUTBOUND_PACKET_SIZE)
     {
         return false;
     }
 
-    return broadcast_fn(send_context, source_socket_fd, framed, framed_length);
+    if (!proto_wrap_packet(packet_body,
+                           packet_length,
+                           s_proto_framed_buffer,
+                           sizeof(s_proto_framed_buffer),
+                           &framed_length))
+    {
+        return false;
+    }
+
+    return broadcast_fn(send_context, source_socket_fd, s_proto_framed_buffer, framed_length);
 }
 
 static bool send_status_response(int socket_fd,
@@ -482,9 +838,8 @@ static bool send_status_response(int socket_fd,
         return false;
     }
 
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x00))
     {
@@ -495,7 +850,7 @@ static bool send_status_response(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_pong(int socket_fd,
@@ -503,9 +858,8 @@ static bool send_pong(int socket_fd,
                       proto_send_callback_t send_fn,
                       void *send_context)
 {
-    uint8_t packet[16];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x01))
     {
@@ -516,7 +870,7 @@ static bool send_pong(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_login_disconnect(int socket_fd,
@@ -537,9 +891,8 @@ static bool send_login_disconnect(int socket_fd,
         return false;
     }
 
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x00))
     {
@@ -550,7 +903,7 @@ static bool send_login_disconnect(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_login_success(int socket_fd,
@@ -558,9 +911,8 @@ static bool send_login_success(int socket_fd,
                                proto_send_callback_t send_fn,
                                void *send_context)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x02) ||
         !proto_write_i64_be(&writer, connection->uuid_most) ||
@@ -570,7 +922,7 @@ static bool send_login_success(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_play_login(int socket_fd,
@@ -579,9 +931,8 @@ static bool send_play_login(int socket_fd,
                             proto_send_callback_t send_fn,
                             void *send_context)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x24) ||
         !write_i32_be(&writer, connection->entity_id) ||
@@ -595,7 +946,7 @@ static bool send_play_login(int socket_fd,
         !proto_write_string(&writer, "minecraft:overworld") ||
         !proto_write_i64_be(&writer, 0) ||
         !proto_write_varint(&writer, server->max_players) ||
-        !proto_write_varint(&writer, 10) ||
+        !proto_write_varint(&writer, SERVER_VIEW_DISTANCE_CHUNKS) ||
         !proto_write_u8(&writer, 0) ||
         !proto_write_u8(&writer, 1) ||
         !proto_write_u8(&writer, 0) ||
@@ -604,7 +955,7 @@ static bool send_play_login(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_initial_position(int socket_fd,
@@ -612,9 +963,8 @@ static bool send_initial_position(int socket_fd,
                                   proto_send_callback_t send_fn,
                                   void *send_context)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x34) ||
         !write_f64_be(&writer, connection->pos_x) ||
@@ -628,7 +978,7 @@ static bool send_initial_position(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool send_keepalive(int socket_fd,
@@ -636,9 +986,8 @@ static bool send_keepalive(int socket_fd,
                            proto_send_callback_t send_fn,
                            void *send_context)
 {
-    uint8_t packet[32];
     proto_writer_t writer;
-    proto_writer_init(&writer, packet, sizeof(packet));
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
     if (!proto_write_varint(&writer, 0x1F) ||
         !proto_write_i64_be(&writer, keepalive_id))
@@ -646,7 +995,7 @@ static bool send_keepalive(int socket_fd,
         return false;
     }
 
-    return send_packet(socket_fd, packet, writer.length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
 static bool build_chat_packet_body(const char *message_text,
@@ -656,13 +1005,13 @@ static bool build_chat_packet_body(const char *message_text,
                                    size_t packet_capacity,
                                    size_t *packet_length)
 {
-    char escaped_message[256];
+    char escaped_message[512];
     if (!escape_json_text(message_text, escaped_message, sizeof(escaped_message)))
     {
         return false;
     }
 
-    char json[300];
+    char json[560];
     int written = snprintf(json, sizeof(json), "{\"text\":\"%s\"}", escaped_message);
     if (written <= 0 || written >= (int)sizeof(json))
     {
@@ -692,7 +1041,7 @@ bool proto_build_chat_packet(const char *message_text,
                              size_t framed_packet_capacity,
                              size_t *framed_packet_length)
 {
-    uint8_t packet_body[SERVER_MAX_PACKET_SIZE];
+    uint8_t packet_body[SERVER_MAX_INBOUND_PACKET_SIZE];
     size_t packet_body_length = 0;
 
     if (!build_chat_packet_body(message_text,
@@ -719,20 +1068,19 @@ static bool send_chat_text_to_client(int socket_fd,
                                      proto_send_callback_t send_fn,
                                      void *send_context)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     size_t packet_length = 0;
 
     if (!build_chat_packet_body(message_text,
                                 uuid_most,
                                 uuid_least,
-                                packet,
-                                sizeof(packet),
+                                s_proto_packet_buffer,
+                                sizeof(s_proto_packet_buffer),
                                 &packet_length))
     {
         return false;
     }
 
-    return send_packet(socket_fd, packet, packet_length, send_fn, send_context);
+    return send_packet(socket_fd, s_proto_packet_buffer, packet_length, send_fn, send_context);
 }
 
 static bool broadcast_chat_text(int source_socket_fd,
@@ -742,20 +1090,98 @@ static bool broadcast_chat_text(int source_socket_fd,
                                 proto_broadcast_callback_t broadcast_fn,
                                 void *send_context)
 {
-    uint8_t packet[SERVER_MAX_PACKET_SIZE];
     size_t packet_length = 0;
 
     if (!build_chat_packet_body(message_text,
                                 uuid_most,
                                 uuid_least,
-                                packet,
-                                sizeof(packet),
+                                s_proto_packet_buffer,
+                                sizeof(s_proto_packet_buffer),
                                 &packet_length))
     {
         return false;
     }
 
-    return broadcast_packet(source_socket_fd, packet, packet_length, broadcast_fn, send_context);
+    return broadcast_packet(source_socket_fd,
+                            s_proto_packet_buffer,
+                            packet_length,
+                            broadcast_fn,
+                            send_context);
+}
+
+static void reset_chunk_stream_state(proto_connection_t *connection)
+{
+    connection->chunk_stream_initialized = false;
+    connection->chunk_center_x = 0;
+    connection->chunk_center_z = 0;
+    connection->chunk_scan_index = 0;
+    connection->chunk_sent_count = 0;
+}
+
+static bool is_chunk_tracked(const proto_connection_t *connection, int32_t chunk_x, int32_t chunk_z)
+{
+    for (uint16_t i = 0; i < connection->chunk_sent_count; i++)
+    {
+        if (connection->sent_chunks[i].x == chunk_x &&
+            connection->sent_chunks[i].z == chunk_z)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void track_chunk(proto_connection_t *connection, int32_t chunk_x, int32_t chunk_z)
+{
+    if (connection->chunk_sent_count >= SERVER_CHUNK_TRACKED_MAX)
+    {
+        connection->chunk_sent_count = 0;
+    }
+
+    connection->sent_chunks[connection->chunk_sent_count].x = chunk_x;
+    connection->sent_chunks[connection->chunk_sent_count].z = chunk_z;
+    connection->chunk_sent_count++;
+}
+
+static int32_t chunk_coord_from_position(double position)
+{
+    return (int32_t)floor(position / 16.0);
+}
+
+static bool send_next_chunk_for_connection(proto_connection_t *connection,
+                                           int socket_fd,
+                                           proto_send_callback_t send_fn,
+                                           void *send_context)
+{
+    int32_t diameter = (SERVER_CHUNK_SEND_RADIUS * 2) + 1;
+    int32_t total = diameter * diameter;
+
+    for (int32_t attempt = 0; attempt < total; attempt++)
+    {
+        int32_t scan_index = (connection->chunk_scan_index + (uint16_t)attempt) % (uint16_t)total;
+        int32_t local_dx = (scan_index % diameter) - SERVER_CHUNK_SEND_RADIUS;
+        int32_t local_dz = (scan_index / diameter) - SERVER_CHUNK_SEND_RADIUS;
+        int32_t chunk_x = connection->chunk_center_x + local_dx;
+        int32_t chunk_z = connection->chunk_center_z + local_dz;
+
+        if (is_chunk_tracked(connection, chunk_x, chunk_z))
+        {
+            continue;
+        }
+
+        if (!send_map_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context) ||
+            !send_update_light_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context))
+        {
+            return false;
+        }
+
+        track_chunk(connection, chunk_x, chunk_z);
+        connection->chunk_scan_index = (uint16_t)((scan_index + 1) % total);
+        return true;
+    }
+
+    return true;
 }
 
 void proto_connection_reset(proto_connection_t *connection)
@@ -768,6 +1194,7 @@ void proto_connection_reset(proto_connection_t *connection)
     connection->yaw = 0.0f;
     connection->pitch = 0.0f;
     connection->on_ground = true;
+    reset_chunk_stream_state(connection);
 }
 
 static void handle_handshake(proto_connection_t *connection, proto_reader_t *reader)
@@ -894,6 +1321,21 @@ static void handle_login(proto_connection_t *connection,
         return;
     }
 
+    reset_chunk_stream_state(connection);
+    connection->chunk_center_x = chunk_coord_from_position(connection->pos_x);
+    connection->chunk_center_z = chunk_coord_from_position(connection->pos_z);
+    connection->chunk_stream_initialized = true;
+
+    if (!send_update_view_position_packet(socket_fd,
+                                          connection->chunk_center_x,
+                                          connection->chunk_center_z,
+                                          send_fn,
+                                          send_context))
+    {
+        connection->close_requested = true;
+        return;
+    }
+
     if (!send_chat_text_to_client(socket_fd,
                                   "ESP32 server online. Movement and chat are active.",
                                   0,
@@ -938,6 +1380,38 @@ static void handle_play_keepalive(proto_connection_t *connection,
     connection->next_keepalive_ms = now_ms + PROTO_KEEPALIVE_INTERVAL_MS;
 }
 
+static bool read_chat_message_limited(proto_reader_t *reader,
+                                      char *out,
+                                      size_t out_size,
+                                      bool *was_clipped)
+{
+    int32_t encoded_length = 0;
+    if (!proto_read_varint(reader, &encoded_length) || encoded_length < 0)
+    {
+        return false;
+    }
+
+    size_t incoming_length = (size_t)encoded_length;
+    if (incoming_length > (reader->length - reader->offset))
+    {
+        return false;
+    }
+
+    size_t copy_length = incoming_length;
+    *was_clipped = false;
+
+    if (copy_length + 1 > out_size)
+    {
+        copy_length = out_size - 1;
+        *was_clipped = true;
+    }
+
+    memcpy(out, reader->data + reader->offset, copy_length);
+    out[copy_length] = '\0';
+    reader->offset += incoming_length;
+    return true;
+}
+
 static void handle_play_chat(proto_connection_t *connection,
                              proto_reader_t *reader,
                              int socket_fd,
@@ -945,11 +1419,27 @@ static void handle_play_chat(proto_connection_t *connection,
                              proto_broadcast_callback_t broadcast_fn,
                              void *send_context)
 {
-    char chat_message[256];
-    if (!proto_read_string(reader, chat_message, sizeof(chat_message)))
+    char chat_message[SERVER_MAX_CHAT_MESSAGE_LENGTH + 1];
+    bool was_clipped = false;
+
+    if (!read_chat_message_limited(reader, chat_message, sizeof(chat_message), &was_clipped))
     {
         connection->close_requested = true;
         return;
+    }
+
+    if (was_clipped)
+    {
+        if (!send_chat_text_to_client(socket_fd,
+                                      "Message exceeded limit and was clipped.",
+                                      0,
+                                      0,
+                                      send_fn,
+                                      send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
     }
 
     if (chat_message[0] == '\0')
@@ -971,7 +1461,7 @@ static void handle_play_chat(proto_connection_t *connection,
         return;
     }
 
-    char line[288];
+    char line[sizeof(connection->username) + SERVER_MAX_CHAT_MESSAGE_LENGTH + 8];
     int written = snprintf(line, sizeof(line), "<%s> %s", connection->username, chat_message);
     if (written <= 0 || written >= (int)sizeof(line))
     {
@@ -1177,5 +1667,38 @@ void proto_tick_connection(proto_connection_t *connection,
         connection->last_keepalive_id = keepalive_id;
         connection->awaiting_keepalive = true;
         connection->keepalive_deadline_ms = now_ms + PROTO_KEEPALIVE_TIMEOUT_MS;
+    }
+
+    int32_t current_chunk_x = chunk_coord_from_position(connection->pos_x);
+    int32_t current_chunk_z = chunk_coord_from_position(connection->pos_z);
+
+    if (!connection->chunk_stream_initialized ||
+        current_chunk_x != connection->chunk_center_x ||
+        current_chunk_z != connection->chunk_center_z)
+    {
+        connection->chunk_stream_initialized = true;
+        connection->chunk_center_x = current_chunk_x;
+        connection->chunk_center_z = current_chunk_z;
+        connection->chunk_scan_index = 0;
+        connection->chunk_sent_count = 0;
+
+        if (!send_update_view_position_packet(socket_fd,
+                                              connection->chunk_center_x,
+                                              connection->chunk_center_z,
+                                              send_fn,
+                                              send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+    }
+
+    for (int32_t send_index = 0; send_index < SERVER_CHUNK_SENDS_PER_TICK; send_index++)
+    {
+        if (!send_next_chunk_for_connection(connection, socket_fd, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
     }
 }

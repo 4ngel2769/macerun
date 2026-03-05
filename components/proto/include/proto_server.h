@@ -4,6 +4,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "server_limits.h"
+
+typedef struct
+{
+    int32_t x;
+    int32_t z;
+} proto_chunk_coord_t;
+
 typedef enum
 {
     PROTO_STATE_HANDSHAKE = 0,
@@ -31,6 +39,12 @@ typedef struct
     float yaw;
     float pitch;
     bool on_ground;
+    bool chunk_stream_initialized;
+    int32_t chunk_center_x;
+    int32_t chunk_center_z;
+    uint16_t chunk_scan_index;
+    uint16_t chunk_sent_count;
+    proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];
     char username[17];
 } proto_connection_t;
 
