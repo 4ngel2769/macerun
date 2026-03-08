@@ -119,11 +119,28 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
     return true;
 }
 
-static void close_client(net_client_t *client)
+static void close_client_with_reason(net_client_t *client, const char *reason)
 {
     if (!client->in_use)
     {
         return;
+    }
+
+    const char *safe_reason = (reason != NULL) ? reason : "unspecified";
+    if (client->protocol.username[0] != '\0')
+    {
+        ESP_LOGW(TAG,
+                 "client disconnected: user=%s fd=%d reason=%s",
+                 client->protocol.username,
+                 client->socket_fd,
+                 safe_reason);
+    }
+    else
+    {
+        ESP_LOGW(TAG,
+                 "client disconnected: fd=%d reason=%s",
+                 client->socket_fd,
+                 safe_reason);
     }
 
     close(client->socket_fd);
@@ -151,7 +168,7 @@ static bool socket_broadcast_except(void *context,
 
         if (!socket_send_all(server, client->socket_fd, data, length))
         {
-            close_client(client);
+            close_client_with_reason(client, "broadcast send failed");
             all_sent = false;
         }
     }
@@ -202,7 +219,10 @@ static void accept_new_clients(net_server_state_t *server)
                 server->clients[i].stream_length = 0;
                 proto_connection_reset(&server->clients[i].protocol);
                 assigned = true;
-                ESP_LOGI(TAG, "client connected in slot %u", (unsigned int)i);
+                ESP_LOGW(TAG,
+                         "client connected: slot=%u fd=%d",
+                         (unsigned int)i,
+                         client_fd);
                 break;
             }
         }
@@ -236,12 +256,14 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
         if (result == PROTO_EXTRACT_ERROR)
         {
             ESP_LOGW(TAG, "invalid packet framing, disconnecting client");
-            close_client(client);
+            close_client_with_reason(client, "invalid packet framing");
             return;
         }
 
         proto_server_info_t server_info;
         fill_server_info(server, &server_info);
+
+        bool was_joined_play = client->protocol.joined_play;
 
         proto_handle_packet(&client->protocol,
                             packet,
@@ -253,9 +275,17 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
                             server,
                             now_ms);
 
+        if (!was_joined_play && client->protocol.joined_play)
+        {
+            ESP_LOGW(TAG,
+                     "player joined: user=%s fd=%d",
+                     client->protocol.username[0] != '\0' ? client->protocol.username : "(unknown)",
+                     client->socket_fd);
+        }
+
         if (client->protocol.close_requested)
         {
-            close_client(client);
+            close_client_with_reason(client, "protocol requested close");
             return;
         }
     }
@@ -274,7 +304,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
             if (client->stream_length + incoming > sizeof(client->stream_buffer))
             {
                 ESP_LOGW(TAG, "stream buffer overflow; disconnecting client");
-                close_client(client);
+                close_client_with_reason(client, "stream buffer overflow");
                 return;
             }
 
@@ -286,7 +316,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
 
         if (received == 0)
         {
-            close_client(client);
+            close_client_with_reason(client, "peer closed connection");
             return;
         }
 
@@ -295,7 +325,8 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
             return;
         }
 
-        close_client(client);
+        ESP_LOGW(TAG, "recv failed, disconnecting client: errno=%d", errno);
+        close_client_with_reason(client, "recv error");
         return;
     }
 }
@@ -383,7 +414,7 @@ static void server_task(void *arg)
 
                 if (server->clients[i].protocol.close_requested)
                 {
-                    close_client(&server->clients[i]);
+                    close_client_with_reason(&server->clients[i], "tick requested close");
                 }
             }
         }
@@ -395,7 +426,7 @@ static void server_task(void *arg)
 
     for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
     {
-        close_client(&server->clients[i]);
+        close_client_with_reason(&server->clients[i], "server stopping");
     }
 
     if (server->listen_fd >= 0)
@@ -462,7 +493,7 @@ esp_err_t net_server_broadcast_chat(const char *message)
         }
         else
         {
-            close_client(client);
+            close_client_with_reason(client, "chat broadcast send failed");
         }
     }
 

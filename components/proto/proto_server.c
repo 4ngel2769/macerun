@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_log.h"
 #include "proto_framing.h"
 #include "server_limits.h"
 #include "block_deltas.h"
@@ -42,6 +43,7 @@ static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
 static world_config_t s_world_config;
 static world_deltas_t s_world_deltas;
+static const char *TAG = "proto_server";
 
 static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
 static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
@@ -1209,6 +1211,7 @@ static void handle_handshake(proto_connection_t *connection, proto_reader_t *rea
         !proto_read_u16_be(reader, &server_port) ||
         !proto_read_varint(reader, &next_state))
     {
+        ESP_LOGW(TAG, "handshake parse failed");
         connection->close_requested = true;
         return;
     }
@@ -1227,6 +1230,7 @@ static void handle_handshake(proto_connection_t *connection, proto_reader_t *rea
     }
     else
     {
+        ESP_LOGW(TAG, "invalid handshake next_state=%ld", (long)next_state);
         connection->close_requested = true;
     }
 }
@@ -1243,6 +1247,7 @@ static void handle_status(proto_connection_t *connection,
     {
         if (!send_status_response(socket_fd, server, send_fn, send_context))
         {
+            ESP_LOGW(TAG, "status response send failed");
             connection->close_requested = true;
         }
         return;
@@ -1253,12 +1258,14 @@ static void handle_status(proto_connection_t *connection,
         int64_t payload = 0;
         if (!proto_read_i64_be(reader, &payload))
         {
+            ESP_LOGW(TAG, "status ping parse failed");
             connection->close_requested = true;
             return;
         }
 
         if (!send_pong(socket_fd, payload, send_fn, send_context))
         {
+            ESP_LOGW(TAG, "status pong send failed");
             connection->close_requested = true;
             return;
         }
@@ -1267,6 +1274,7 @@ static void handle_status(proto_connection_t *connection,
         return;
     }
 
+    ESP_LOGW(TAG, "unexpected status packet id=0x%lx", (long)packet_id);
     connection->close_requested = true;
 }
 
@@ -1282,18 +1290,21 @@ static void handle_login(proto_connection_t *connection,
 {
     if (packet_id != 0x00)
     {
+        ESP_LOGW(TAG, "unexpected login packet id=0x%lx", (long)packet_id);
         connection->close_requested = true;
         return;
     }
 
     if (!proto_read_string(reader, connection->username, sizeof(connection->username)))
     {
+        ESP_LOGW(TAG, "login username parse failed");
         connection->close_requested = true;
         return;
     }
 
     if (connection->username[0] == '\0')
     {
+        ESP_LOGW(TAG, "login rejected: empty username");
         send_login_disconnect(socket_fd, "Username is required.", send_fn, send_context);
         connection->close_requested = true;
         return;
@@ -1304,6 +1315,7 @@ static void handle_login(proto_connection_t *connection,
 
     if (!send_login_success(socket_fd, connection, send_fn, send_context))
     {
+        ESP_LOGW(TAG, "login success packet send failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
@@ -1317,6 +1329,7 @@ static void handle_login(proto_connection_t *connection,
     if (!send_play_login(socket_fd, connection, server, send_fn, send_context) ||
         !send_initial_position(socket_fd, connection, send_fn, send_context))
     {
+        ESP_LOGW(TAG, "play init packet send failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
@@ -1332,6 +1345,7 @@ static void handle_login(proto_connection_t *connection,
                                           send_fn,
                                           send_context))
     {
+        ESP_LOGW(TAG, "initial view position send failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
@@ -1343,9 +1357,15 @@ static void handle_login(proto_connection_t *connection,
                                   send_fn,
                                   send_context))
     {
+        ESP_LOGW(TAG, "welcome chat send failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
+
+    ESP_LOGW(TAG,
+             "player session started: user=%s entity_id=%ld",
+             connection->username,
+             (long)connection->entity_id);
 
     char joined_message[96];
     int joined_written = snprintf(joined_message,
@@ -1365,12 +1385,19 @@ static void handle_play_keepalive(proto_connection_t *connection,
     int64_t keepalive_id = 0;
     if (!proto_read_i64_be(reader, &keepalive_id))
     {
+        ESP_LOGW(TAG, "keepalive parse failed: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
         connection->close_requested = true;
         return;
     }
 
     if (!connection->awaiting_keepalive || keepalive_id != connection->last_keepalive_id)
     {
+        ESP_LOGW(TAG,
+                 "keepalive mismatch: user=%s expected=%lld got=%lld",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)",
+                 (long long)connection->last_keepalive_id,
+                 (long long)keepalive_id);
         connection->close_requested = true;
         return;
     }
@@ -1424,12 +1451,19 @@ static void handle_play_chat(proto_connection_t *connection,
 
     if (!read_chat_message_limited(reader, chat_message, sizeof(chat_message), &was_clipped))
     {
+        ESP_LOGW(TAG,
+                 "chat parse failed: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
         connection->close_requested = true;
         return;
     }
 
     if (was_clipped)
     {
+        ESP_LOGW(TAG,
+                 "chat clipped to %u chars: user=%s",
+                 (unsigned int)SERVER_MAX_CHAT_MESSAGE_LENGTH,
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
         if (!send_chat_text_to_client(socket_fd,
                                       "Message exceeded limit and was clipped.",
                                       0,
@@ -1449,6 +1483,10 @@ static void handle_play_chat(proto_connection_t *connection,
 
     if (chat_message[0] == '/')
     {
+        ESP_LOGW(TAG,
+                 "command rejected: user=%s cmd=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)",
+                 chat_message);
         if (!send_chat_text_to_client(socket_fd,
                                       "Commands are not supported on this MVP server.",
                                       0,
@@ -1467,6 +1505,8 @@ static void handle_play_chat(proto_connection_t *connection,
     {
         return;
     }
+
+    ESP_LOGW(TAG, "chat: %s", line);
 
     if (!send_chat_text_to_client(socket_fd,
                                   line,
@@ -1585,6 +1625,7 @@ void proto_handle_packet(proto_connection_t *connection,
     int32_t packet_id = 0;
     if (!proto_read_varint(&reader, &packet_id))
     {
+        ESP_LOGW(TAG, "failed to read packet id");
         connection->close_requested = true;
         return;
     }
@@ -1651,6 +1692,9 @@ void proto_tick_connection(proto_connection_t *connection,
 
     if (connection->awaiting_keepalive && now_ms >= connection->keepalive_deadline_ms)
     {
+        ESP_LOGW(TAG,
+                 "keepalive timeout: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
         connection->close_requested = true;
         return;
     }
@@ -1660,6 +1704,9 @@ void proto_tick_connection(proto_connection_t *connection,
         int64_t keepalive_id = ((int64_t)now_ms << 8) ^ (int64_t)(connection->entity_id & 0xFF);
         if (!send_keepalive(socket_fd, keepalive_id, send_fn, send_context))
         {
+            ESP_LOGW(TAG,
+                     "keepalive send failed: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
             connection->close_requested = true;
             return;
         }
