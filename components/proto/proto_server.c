@@ -3,9 +3,12 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "esp_err.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "proto_framing.h"
 #include "server_limits.h"
 #include "block_deltas.h"
@@ -38,6 +41,9 @@ typedef enum
 #define PROTO_HEIGHTMAP_LONG_COUNT 36
 #define PROTO_BIOME_ARRAY_COUNT (4 * 4 * 64)
 #define PROTO_CHUNK_LIGHT_EMPTY_MASK ((1 << PROTO_LIGHT_SECTION_COUNT) - 1)
+#define PROTO_WORLD_NVS_NAMESPACE "macerun"
+#define PROTO_WORLD_NVS_KEY "world_deltas"
+#define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
@@ -61,6 +67,9 @@ static bool broadcast_packet(int source_socket_fd,
                              proto_broadcast_callback_t broadcast_fn,
                              void *send_context);
 
+static bool load_world_deltas_from_nvs(void);
+static bool persist_world_deltas_to_nvs(void);
+
 static void ensure_world_initialized(void)
 {
     if (s_world_initialized)
@@ -70,6 +79,10 @@ static void ensure_world_initialized(void)
 
     world_config_set_defaults(&s_world_config, WORLD_SEED_DEFAULT);
     world_deltas_init(&s_world_deltas);
+    if (!load_world_deltas_from_nvs())
+    {
+        ESP_LOGW(TAG, "world delta restore failed; starting with empty overrides");
+    }
     s_world_initialized = true;
 }
 
@@ -405,6 +418,165 @@ static int32_t world_block_to_state_id(uint8_t block_id)
     return block_id == BLOCK_AIR ? 0 : 1;
 }
 
+static int32_t sign_extend_i32(uint32_t value, uint8_t width_bits)
+{
+    if (width_bits == 0 || width_bits >= 32)
+    {
+        return (int32_t)value;
+    }
+
+    uint32_t shift = 32u - (uint32_t)width_bits;
+    return ((int32_t)(value << shift)) >> shift;
+}
+
+static bool read_block_position(proto_reader_t *reader,
+                                int32_t *x_out,
+                                int32_t *y_out,
+                                int32_t *z_out)
+{
+    int64_t packed_signed = 0;
+    if (!proto_read_i64_be(reader, &packed_signed))
+    {
+        return false;
+    }
+
+    uint64_t packed = (uint64_t)packed_signed;
+    uint32_t raw_x = (uint32_t)((packed >> 38) & 0x3FFFFFFULL);
+    uint32_t raw_y = (uint32_t)(packed & 0xFFFULL);
+    uint32_t raw_z = (uint32_t)((packed >> 12) & 0x3FFFFFFULL);
+
+    *x_out = sign_extend_i32(raw_x, 26);
+    *y_out = sign_extend_i32(raw_y, 12);
+    *z_out = sign_extend_i32(raw_z, 26);
+    return true;
+}
+
+static bool write_block_position(proto_writer_t *writer,
+                                 int32_t x,
+                                 int32_t y,
+                                 int32_t z)
+{
+    uint64_t packed = (((uint64_t)x & 0x3FFFFFFULL) << 38) |
+                      (((uint64_t)z & 0x3FFFFFFULL) << 12) |
+                      ((uint64_t)y & 0xFFFULL);
+    return proto_write_i64_be(writer, (int64_t)packed);
+}
+
+static bool load_world_deltas_from_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return true;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "nvs_open(read) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    size_t blob_size = 0;
+    err = nvs_get_blob(handle, PROTO_WORLD_NVS_KEY, NULL, &blob_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        nvs_close(handle);
+        return true;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "nvs_get_blob(size) failed: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return false;
+    }
+
+    if (blob_size == 0)
+    {
+        nvs_close(handle);
+        return true;
+    }
+
+    void *blob_data = malloc(blob_size);
+    if (blob_data == NULL)
+    {
+        ESP_LOGW(TAG, "world delta restore failed: alloc %u bytes", (unsigned int)blob_size);
+        nvs_close(handle);
+        return false;
+    }
+
+    size_t read_size = blob_size;
+    err = nvs_get_blob(handle, PROTO_WORLD_NVS_KEY, blob_data, &read_size);
+    nvs_close(handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "nvs_get_blob(data) failed: %s", esp_err_to_name(err));
+        free(blob_data);
+        return false;
+    }
+
+    size_t restored_count = read_size / sizeof(world_block_delta_t);
+    if (restored_count > WORLD_MAX_BLOCK_DELTAS)
+    {
+        restored_count = WORLD_MAX_BLOCK_DELTAS;
+    }
+
+    memcpy(s_world_deltas.entries,
+           blob_data,
+           restored_count * sizeof(world_block_delta_t));
+    s_world_deltas.count = restored_count;
+    free(blob_data);
+
+    ESP_LOGW(TAG,
+             "restored %u world delta entries from NVS",
+             (unsigned int)s_world_deltas.count);
+    return true;
+}
+
+static bool persist_world_deltas_to_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "nvs_open(write) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (s_world_deltas.count == 0)
+    {
+        err = nvs_erase_key(handle, PROTO_WORLD_NVS_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            err = ESP_OK;
+        }
+    }
+    else
+    {
+        size_t data_size = s_world_deltas.count * sizeof(world_block_delta_t);
+        err = nvs_set_blob(handle,
+                           PROTO_WORLD_NVS_KEY,
+                           s_world_deltas.entries,
+                           data_size);
+    }
+
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "world delta persist failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
 static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
 {
     ensure_world_initialized();
@@ -417,6 +589,99 @@ static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
 
     block_id = world_query_block(&s_world_config, x, y, z);
     return world_block_to_state_id(block_id);
+}
+
+static bool set_block_override(int32_t x,
+                               int32_t y,
+                               int32_t z,
+                               uint8_t block_id,
+                               bool *changed_out)
+{
+    ensure_world_initialized();
+    *changed_out = false;
+
+    if (y < s_world_config.min_y || y > s_world_config.max_y)
+    {
+        return true;
+    }
+
+    int32_t current_state_id = query_block_state_id(x, y, z);
+    int32_t next_state_id = world_block_to_state_id(block_id);
+    if (current_state_id == next_state_id)
+    {
+        return true;
+    }
+
+    if (!world_deltas_put(&s_world_deltas, x, y, z, block_id))
+    {
+        return false;
+    }
+
+    if (!persist_world_deltas_to_nvs())
+    {
+        ESP_LOGW(TAG, "continuing with in-memory world deltas only");
+    }
+
+    *changed_out = true;
+    return true;
+}
+
+static bool build_block_change_packet_body(int32_t x,
+                                           int32_t y,
+                                           int32_t z,
+                                           int32_t block_state_id,
+                                           size_t *packet_length_out)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x0B) ||
+        !write_block_position(&writer, x, y, z) ||
+        !proto_write_varint(&writer, block_state_id))
+    {
+        return false;
+    }
+
+    *packet_length_out = writer.length;
+    return true;
+}
+
+static void publish_block_change(int socket_fd,
+                                 int32_t x,
+                                 int32_t y,
+                                 int32_t z,
+                                 int32_t block_state_id,
+                                 proto_send_callback_t send_fn,
+                                 proto_broadcast_callback_t broadcast_fn,
+                                 void *send_context)
+{
+    size_t packet_length = 0;
+    if (!build_block_change_packet_body(x, y, z, block_state_id, &packet_length))
+    {
+        ESP_LOGW(TAG, "block change packet build failed at (%ld,%ld,%ld)",
+                 (long)x,
+                 (long)y,
+                 (long)z);
+        return;
+    }
+
+    if (!send_packet(socket_fd,
+                     s_proto_packet_buffer,
+                     packet_length,
+                     send_fn,
+                     send_context))
+    {
+        ESP_LOGW(TAG, "block change send failed for source socket=%d", socket_fd);
+    }
+
+    if (!broadcast_packet(socket_fd,
+                          s_proto_packet_buffer,
+                          packet_length,
+                          broadcast_fn,
+                          send_context))
+    {
+        ESP_LOGW(TAG, "block change broadcast had delivery failures");
+    }
 }
 
 static void fill_height_samples(int32_t chunk_x,
@@ -588,6 +853,25 @@ static bool send_update_view_position_packet(int socket_fd,
     if (!proto_write_varint(&writer, 0x40) ||
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_unload_chunk_packet(int socket_fd,
+                                     int32_t chunk_x,
+                                     int32_t chunk_z,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x1C) ||
+        !write_i32_be(&writer, chunk_x) ||
+        !write_i32_be(&writer, chunk_z))
     {
         return false;
     }
@@ -1146,6 +1430,55 @@ static void track_chunk(proto_connection_t *connection, int32_t chunk_x, int32_t
     connection->chunk_sent_count++;
 }
 
+static bool is_chunk_in_stream_window(const proto_connection_t *connection,
+                                      int32_t chunk_x,
+                                      int32_t chunk_z)
+{
+    int32_t min_x = connection->chunk_center_x - SERVER_CHUNK_SEND_RADIUS;
+    int32_t max_x = connection->chunk_center_x + SERVER_CHUNK_SEND_RADIUS;
+    int32_t min_z = connection->chunk_center_z - SERVER_CHUNK_SEND_RADIUS;
+    int32_t max_z = connection->chunk_center_z + SERVER_CHUNK_SEND_RADIUS;
+
+    return chunk_x >= min_x && chunk_x <= max_x &&
+           chunk_z >= min_z && chunk_z <= max_z;
+}
+
+static void prune_tracked_chunks(proto_connection_t *connection,
+                                 int socket_fd,
+                                 proto_send_callback_t send_fn,
+                                 void *send_context)
+{
+    uint16_t index = 0;
+    while (index < connection->chunk_sent_count)
+    {
+        int32_t chunk_x = connection->sent_chunks[index].x;
+        int32_t chunk_z = connection->sent_chunks[index].z;
+
+        if (is_chunk_in_stream_window(connection, chunk_x, chunk_z))
+        {
+            index++;
+            continue;
+        }
+
+        if (!send_unload_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context))
+        {
+            ESP_LOGW(TAG,
+                     "unload chunk send failed for (%ld,%ld)",
+                     (long)chunk_x,
+                     (long)chunk_z);
+            index++;
+            continue;
+        }
+
+        uint16_t last_index = connection->chunk_sent_count - 1;
+        if (index != last_index)
+        {
+            connection->sent_chunks[index] = connection->sent_chunks[last_index];
+        }
+        connection->chunk_sent_count--;
+    }
+}
+
 static int32_t chunk_coord_from_position(double position)
 {
     return (int32_t)floor(position / 16.0);
@@ -1175,7 +1508,12 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
         if (!send_map_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context) ||
             !send_update_light_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context))
         {
-            return false;
+            ESP_LOGW(TAG,
+                     "chunk send failed at (%ld,%ld); will retry",
+                     (long)chunk_x,
+                     (long)chunk_z);
+            connection->chunk_scan_index = (uint16_t)((scan_index + 1) % total);
+            return true;
         }
 
         track_chunk(connection, chunk_x, chunk_z);
@@ -1576,6 +1914,162 @@ static void handle_play_movement(proto_connection_t *connection,
     }
 }
 
+static bool adjust_position_for_face(int32_t *x, int32_t *y, int32_t *z, int32_t face)
+{
+    switch (face)
+    {
+    case 0:
+        (*y)--;
+        return true;
+    case 1:
+        (*y)++;
+        return true;
+    case 2:
+        (*z)--;
+        return true;
+    case 3:
+        (*z)++;
+        return true;
+    case 4:
+        (*x)--;
+        return true;
+    case 5:
+        (*x)++;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void handle_play_block_dig(proto_connection_t *connection,
+                                  proto_reader_t *reader,
+                                  int socket_fd,
+                                  proto_send_callback_t send_fn,
+                                  proto_broadcast_callback_t broadcast_fn,
+                                  void *send_context)
+{
+    int32_t status = 0;
+    int32_t world_x = 0;
+    int32_t world_y = 0;
+    int32_t world_z = 0;
+    uint8_t face = 0;
+
+    if (!proto_read_varint(reader, &status) ||
+        !read_block_position(reader, &world_x, &world_y, &world_z) ||
+        !proto_read_u8(reader, &face))
+    {
+        ESP_LOGW(TAG, "block dig parse failed");
+        connection->close_requested = true;
+        return;
+    }
+
+    (void)face;
+
+    if (status != 2)
+    {
+        return;
+    }
+
+    bool changed = false;
+    if (!set_block_override(world_x, world_y, world_z, BLOCK_AIR, &changed))
+    {
+        ESP_LOGW(TAG,
+                 "block dig rejected at (%ld,%ld,%ld)",
+                 (long)world_x,
+                 (long)world_y,
+                 (long)world_z);
+        return;
+    }
+
+    if (!changed)
+    {
+        return;
+    }
+
+    publish_block_change(socket_fd,
+                         world_x,
+                         world_y,
+                         world_z,
+                         world_block_to_state_id(BLOCK_AIR),
+                         send_fn,
+                         broadcast_fn,
+                         send_context);
+}
+
+static void handle_play_block_place(proto_connection_t *connection,
+                                    proto_reader_t *reader,
+                                    int socket_fd,
+                                    proto_send_callback_t send_fn,
+                                    proto_broadcast_callback_t broadcast_fn,
+                                    void *send_context)
+{
+    int32_t hand = 0;
+    int32_t face = 0;
+    int32_t target_x = 0;
+    int32_t target_y = 0;
+    int32_t target_z = 0;
+    float cursor_x = 0.0f;
+    float cursor_y = 0.0f;
+    float cursor_z = 0.0f;
+    bool inside_block = false;
+
+    if (!proto_read_varint(reader, &hand) ||
+        !read_block_position(reader, &target_x, &target_y, &target_z) ||
+        !proto_read_varint(reader, &face) ||
+        !read_f32_be(reader, &cursor_x) ||
+        !read_f32_be(reader, &cursor_y) ||
+        !read_f32_be(reader, &cursor_z) ||
+        !read_bool(reader, &inside_block))
+    {
+        ESP_LOGW(TAG, "block place parse failed");
+        connection->close_requested = true;
+        return;
+    }
+
+    (void)hand;
+    (void)cursor_x;
+    (void)cursor_y;
+    (void)cursor_z;
+    (void)inside_block;
+
+    int32_t place_x = target_x;
+    int32_t place_y = target_y;
+    int32_t place_z = target_z;
+    if (!adjust_position_for_face(&place_x, &place_y, &place_z, face))
+    {
+        return;
+    }
+
+    bool changed = false;
+    if (!set_block_override(place_x,
+                            place_y,
+                            place_z,
+                            BLOCK_COBBLESTONE,
+                            &changed))
+    {
+        ESP_LOGW(TAG,
+                 "block place rejected at (%ld,%ld,%ld)",
+                 (long)place_x,
+                 (long)place_y,
+                 (long)place_z);
+        return;
+    }
+
+    if (!changed)
+    {
+        return;
+    }
+
+    publish_block_change(socket_fd,
+                         place_x,
+                         place_y,
+                         place_z,
+                         world_block_to_state_id(BLOCK_COBBLESTONE),
+                         send_fn,
+                         broadcast_fn,
+                         send_context);
+}
+
 static void handle_play(proto_connection_t *connection,
                         int32_t packet_id,
                         proto_reader_t *reader,
@@ -1602,6 +2096,24 @@ static void handle_play(proto_connection_t *connection,
     case 0x14:
     case 0x15:
         handle_play_movement(connection, packet_id, reader);
+        break;
+
+    case 0x1B:
+        handle_play_block_dig(connection,
+                              reader,
+                              socket_fd,
+                              send_fn,
+                              broadcast_fn,
+                              send_context);
+        break;
+
+    case 0x2E:
+        handle_play_block_place(connection,
+                                reader,
+                                socket_fd,
+                                send_fn,
+                                broadcast_fn,
+                                send_context);
         break;
 
     default:
@@ -1705,15 +2217,16 @@ void proto_tick_connection(proto_connection_t *connection,
         if (!send_keepalive(socket_fd, keepalive_id, send_fn, send_context))
         {
             ESP_LOGW(TAG,
-                     "keepalive send failed: user=%s",
+                     "keepalive send deferred: user=%s",
                      connection->username[0] != '\0' ? connection->username : "(unknown)");
-            connection->close_requested = true;
-            return;
+            connection->next_keepalive_ms = now_ms + PROTO_KEEPALIVE_RETRY_DELAY_MS;
         }
-
-        connection->last_keepalive_id = keepalive_id;
-        connection->awaiting_keepalive = true;
-        connection->keepalive_deadline_ms = now_ms + PROTO_KEEPALIVE_TIMEOUT_MS;
+        else
+        {
+            connection->last_keepalive_id = keepalive_id;
+            connection->awaiting_keepalive = true;
+            connection->keepalive_deadline_ms = now_ms + PROTO_KEEPALIVE_TIMEOUT_MS;
+        }
     }
 
     int32_t current_chunk_x = chunk_coord_from_position(connection->pos_x);
@@ -1727,7 +2240,6 @@ void proto_tick_connection(proto_connection_t *connection,
         connection->chunk_center_x = current_chunk_x;
         connection->chunk_center_z = current_chunk_z;
         connection->chunk_scan_index = 0;
-        connection->chunk_sent_count = 0;
 
         if (!send_update_view_position_packet(socket_fd,
                                               connection->chunk_center_x,
@@ -1735,17 +2247,22 @@ void proto_tick_connection(proto_connection_t *connection,
                                               send_fn,
                                               send_context))
         {
-            connection->close_requested = true;
-            return;
+            ESP_LOGW(TAG,
+                     "view position update deferred: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
         }
+
+        prune_tracked_chunks(connection, socket_fd, send_fn, send_context);
     }
 
     for (int32_t send_index = 0; send_index < SERVER_CHUNK_SENDS_PER_TICK; send_index++)
     {
         if (!send_next_chunk_for_connection(connection, socket_fd, send_fn, send_context))
         {
-            connection->close_requested = true;
-            return;
+            ESP_LOGW(TAG,
+                     "chunk stream tick encountered an internal failure: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
+            break;
         }
     }
 }

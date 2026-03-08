@@ -6,7 +6,7 @@
 
 #include "server_limits.h"
 
-typedef struct
+typedef struct __attribute__((packed))
 {
     int16_t x;
     uint8_t y;
