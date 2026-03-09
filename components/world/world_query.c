@@ -5,6 +5,8 @@
 
 #include "server_limits.h"
 
+#define WORLD_TREE_CELL_SIZE 8
+
 static int32_t floor_div(int32_t value, int32_t divisor)
 {
     int32_t result = value / divisor;
@@ -32,6 +34,11 @@ static uint32_t hash_xz(uint32_t seed, int32_t x, int32_t z, uint32_t salt)
     value ^= (uint32_t)x * 0x9e3779b9u;
     value ^= (uint32_t)z * 0x85ebca6bu;
     return hash_mix(value);
+}
+
+static int32_t abs_i32(int32_t value)
+{
+    return value < 0 ? -value : value;
 }
 
 static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value)
@@ -168,6 +175,117 @@ static uint8_t biome_surface_block(world_biome_t biome)
     }
 }
 
+static bool biome_supports_trees(world_biome_t biome, uint32_t tree_hash)
+{
+    if (biome == WORLD_BIOME_FOREST)
+    {
+        return (tree_hash & 0x3u) == 0;
+    }
+
+    if (biome == WORLD_BIOME_PLAINS)
+    {
+        return (tree_hash & 0xFu) == 0;
+    }
+
+    return false;
+}
+
+static bool query_tree_block(const world_config_t *config,
+                             int32_t x,
+                             int32_t y,
+                             int32_t z,
+                             uint8_t *block_out)
+{
+    int32_t base_cell_x = floor_div(x, WORLD_TREE_CELL_SIZE);
+    int32_t base_cell_z = floor_div(z, WORLD_TREE_CELL_SIZE);
+
+    for (int32_t cell_dz = -1; cell_dz <= 1; cell_dz++)
+    {
+        for (int32_t cell_dx = -1; cell_dx <= 1; cell_dx++)
+        {
+            int32_t cell_x = base_cell_x + cell_dx;
+            int32_t cell_z = base_cell_z + cell_dz;
+            uint32_t tree_hash = hash_xz(config->seed ^ 0x7157A11u,
+                                         cell_x,
+                                         cell_z,
+                                         0x54C3B17u);
+
+            int32_t anchor_x = (cell_x * WORLD_TREE_CELL_SIZE) + (int32_t)(tree_hash & 0x7u);
+            int32_t anchor_z = (cell_z * WORLD_TREE_CELL_SIZE) + (int32_t)((tree_hash >> 3) & 0x7u);
+
+            world_biome_t anchor_biome = world_query_biome(config, anchor_x, anchor_z);
+            if (!biome_supports_trees(anchor_biome, tree_hash >> 6))
+            {
+                continue;
+            }
+
+            int16_t anchor_surface = world_query_surface_y(config, anchor_x, anchor_z);
+            if (anchor_surface <= config->sea_level)
+            {
+                continue;
+            }
+
+            int32_t trunk_base_y = anchor_surface + 1;
+            int32_t trunk_height = 4 + (int32_t)((tree_hash >> 11) & 0x1u);
+            int32_t trunk_top_y = trunk_base_y + trunk_height - 1;
+            if (trunk_top_y + 2 > config->max_y)
+            {
+                continue;
+            }
+
+            int32_t dx = abs_i32(x - anchor_x);
+            int32_t dz = abs_i32(z - anchor_z);
+
+            if (x == anchor_x &&
+                z == anchor_z &&
+                y >= trunk_base_y &&
+                y <= trunk_top_y)
+            {
+                *block_out = BLOCK_OAK_LOG;
+                return true;
+            }
+
+            if (y < trunk_top_y - 2 || y > trunk_top_y + 1 || dx > 2 || dz > 2)
+            {
+                continue;
+            }
+
+            if (dx == 0 && dz == 0)
+            {
+                continue;
+            }
+
+            int32_t taxicab = dx + dz;
+            if (y == trunk_top_y + 1)
+            {
+                if (taxicab > 1)
+                {
+                    continue;
+                }
+            }
+            else if (y == trunk_top_y)
+            {
+                if (taxicab > 3)
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                if (dx == 2 && dz == 2)
+                {
+                    continue;
+                }
+            }
+
+            *block_out = BLOCK_OAK_LEAVES;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 uint8_t world_query_block(const world_config_t *config, int32_t x, int32_t y, int32_t z)
 {
     if (y < config->min_y || y > config->max_y)
@@ -189,6 +307,16 @@ uint8_t world_query_block(const world_config_t *config, int32_t x, int32_t y, in
         {
             return BLOCK_WATER;
         }
+
+        if (y <= surface_y + 8)
+        {
+            uint8_t tree_block = BLOCK_AIR;
+            if (query_tree_block(config, x, y, z, &tree_block))
+            {
+                return tree_block;
+            }
+        }
+
         return BLOCK_AIR;
     }
 

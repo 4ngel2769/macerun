@@ -20,6 +20,8 @@ typedef enum
     BLOCK_WATER = 9,
     BLOCK_BEDROCK = 7,
     BLOCK_SAND = 12,
+    BLOCK_OAK_LOG = 17,
+    BLOCK_OAK_LEAVES = 18,
     BLOCK_DIAMOND_ORE = 56,
     BLOCK_SNOW_BLOCK = 80,
 } world_block_id_t;

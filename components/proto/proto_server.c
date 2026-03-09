@@ -41,6 +41,7 @@ typedef enum
 #define PROTO_HEIGHTMAP_LONG_COUNT 36
 #define PROTO_BIOME_ARRAY_COUNT (4 * 4 * 64)
 #define PROTO_CHUNK_LIGHT_EMPTY_MASK ((1 << PROTO_LIGHT_SECTION_COUNT) - 1)
+#define PROTO_CHUNK_BITS_PER_BLOCK 4
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
 #define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
@@ -54,6 +55,23 @@ static const char *TAG = "proto_server";
 static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
 static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
 static uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
+
+static const int32_t s_chunk_palette_state_ids[] = {
+    0,
+    1,
+    9,
+    10,
+    14,
+    33,
+    34,
+    66,
+    74,
+    158,
+    3354,
+    3930,
+};
+
+#define PROTO_CHUNK_PALETTE_SIZE ((int32_t)(sizeof(s_chunk_palette_state_ids) / sizeof(s_chunk_palette_state_ids[0])))
 
 static bool send_packet(int socket_fd,
                         const uint8_t *packet_body,
@@ -415,7 +433,81 @@ static bool nbt_write_named_long_array(proto_writer_t *writer,
 
 static int32_t world_block_to_state_id(uint8_t block_id)
 {
-    return block_id == BLOCK_AIR ? 0 : 1;
+    switch (block_id)
+    {
+    case BLOCK_AIR:
+        return 0;
+    case BLOCK_STONE:
+        return 1;
+    case BLOCK_GRASS:
+        return 9;
+    case BLOCK_DIRT:
+        return 10;
+    case BLOCK_COBBLESTONE:
+        return 14;
+    case BLOCK_BEDROCK:
+        return 33;
+    case BLOCK_WATER:
+        return 34;
+    case BLOCK_SAND:
+        return 66;
+    case BLOCK_OAK_LOG:
+        return 74;
+    case BLOCK_OAK_LEAVES:
+        return 158;
+    case BLOCK_DIAMOND_ORE:
+        return 3354;
+    case BLOCK_SNOW_BLOCK:
+        return 3930;
+    default:
+        return 1;
+    }
+}
+
+static uint8_t world_block_to_palette_index(uint8_t block_id)
+{
+    switch (block_id)
+    {
+    case BLOCK_AIR:
+        return 0;
+    case BLOCK_STONE:
+        return 1;
+    case BLOCK_GRASS:
+        return 2;
+    case BLOCK_DIRT:
+        return 3;
+    case BLOCK_COBBLESTONE:
+        return 4;
+    case BLOCK_BEDROCK:
+        return 5;
+    case BLOCK_WATER:
+        return 6;
+    case BLOCK_SAND:
+        return 7;
+    case BLOCK_OAK_LOG:
+        return 8;
+    case BLOCK_OAK_LEAVES:
+        return 9;
+    case BLOCK_DIAMOND_ORE:
+        return 10;
+    case BLOCK_SNOW_BLOCK:
+        return 11;
+    default:
+        return 1;
+    }
+}
+
+static uint8_t query_block_id(int32_t x, int32_t y, int32_t z)
+{
+    ensure_world_initialized();
+
+    uint8_t block_id = 0;
+    if (world_deltas_get(&s_world_deltas, x, y, z, &block_id))
+    {
+        return block_id;
+    }
+
+    return world_query_block(&s_world_config, x, y, z);
 }
 
 static int32_t sign_extend_i32(uint32_t value, uint8_t width_bits)
@@ -579,15 +671,7 @@ static bool persist_world_deltas_to_nvs(void)
 
 static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
 {
-    ensure_world_initialized();
-
-    uint8_t block_id = 0;
-    if (world_deltas_get(&s_world_deltas, x, y, z, &block_id))
-    {
-        return world_block_to_state_id(block_id);
-    }
-
-    block_id = world_query_block(&s_world_config, x, y, z);
+    uint8_t block_id = query_block_id(x, y, z);
     return world_block_to_state_id(block_id);
 }
 
@@ -771,26 +855,39 @@ static bool encode_chunk_sections(int32_t chunk_x,
     proto_writer_init(&chunk_writer, s_proto_chunk_data_buffer, sizeof(s_proto_chunk_data_buffer));
 
     int32_t section_mask = 0;
+    int32_t max_section_index = s_world_config.max_y / PROTO_SECTION_HEIGHT;
+    if (max_section_index < 0)
+    {
+        max_section_index = 0;
+    }
+    if (max_section_index >= PROTO_SECTION_COUNT)
+    {
+        max_section_index = PROTO_SECTION_COUNT - 1;
+    }
 
-    for (int32_t section_index = 0; section_index < PROTO_SECTION_COUNT; section_index++)
+    for (int32_t section_index = 0; section_index <= max_section_index; section_index++)
     {
         int32_t section_base_y = section_index * PROTO_SECTION_HEIGHT;
         int32_t solid_block_count = 0;
+        uint8_t palette_indices[PROTO_SECTION_VOLUME] = {0};
 
-        for (int32_t local_y = 0; local_y < PROTO_SECTION_HEIGHT; local_y++)
+        for (int32_t block_index = 0; block_index < PROTO_SECTION_VOLUME; block_index++)
         {
-            for (int32_t local_z = 0; local_z < PROTO_SECTION_WIDTH; local_z++)
+            int32_t local_x = block_index & 0x0F;
+            int32_t local_z = (block_index >> 4) & 0x0F;
+            int32_t local_y = (block_index >> 8) & 0x0F;
+
+            int32_t world_x = (chunk_x << 4) + local_x;
+            int32_t world_y = section_base_y + local_y;
+            int32_t world_z = (chunk_z << 4) + local_z;
+
+            uint8_t palette_index = world_block_to_palette_index(query_block_id(world_x,
+                                                                                 world_y,
+                                                                                 world_z));
+            palette_indices[block_index] = palette_index;
+            if (palette_index != 0)
             {
-                for (int32_t local_x = 0; local_x < PROTO_SECTION_WIDTH; local_x++)
-                {
-                    int32_t world_x = (chunk_x << 4) + local_x;
-                    int32_t world_y = section_base_y + local_y;
-                    int32_t world_z = (chunk_z << 4) + local_z;
-                    if (query_block_state_id(world_x, world_y, world_z) != 0)
-                    {
-                        solid_block_count++;
-                    }
-                }
+                solid_block_count++;
             }
         }
 
@@ -802,11 +899,21 @@ static bool encode_chunk_sections(int32_t chunk_x,
         section_mask |= (1 << section_index);
 
         if (!proto_write_u16_be(&chunk_writer, (uint16_t)solid_block_count) ||
-            !proto_write_u8(&chunk_writer, 4) ||
-            !proto_write_varint(&chunk_writer, 2) ||
-            !proto_write_varint(&chunk_writer, 0) ||
-            !proto_write_varint(&chunk_writer, 1) ||
-            !proto_write_varint(&chunk_writer, PROTO_SECTION_VOLUME / 16))
+            !proto_write_u8(&chunk_writer, PROTO_CHUNK_BITS_PER_BLOCK) ||
+            !proto_write_varint(&chunk_writer, PROTO_CHUNK_PALETTE_SIZE))
+        {
+            return false;
+        }
+
+        for (int32_t palette_index = 0; palette_index < PROTO_CHUNK_PALETTE_SIZE; palette_index++)
+        {
+            if (!proto_write_varint(&chunk_writer, s_chunk_palette_state_ids[palette_index]))
+            {
+                return false;
+            }
+        }
+
+        if (!proto_write_varint(&chunk_writer, PROTO_SECTION_VOLUME / 16))
         {
             return false;
         }
@@ -817,15 +924,7 @@ static bool encode_chunk_sections(int32_t chunk_x,
             for (int32_t value_index = 0; value_index < 16; value_index++)
             {
                 int32_t block_index = (long_index * 16) + value_index;
-                int32_t local_x = block_index & 0x0F;
-                int32_t local_z = (block_index >> 4) & 0x0F;
-                int32_t local_y = (block_index >> 8) & 0x0F;
-
-                int32_t world_x = (chunk_x << 4) + local_x;
-                int32_t world_y = section_base_y + local_y;
-                int32_t world_z = (chunk_z << 4) + local_z;
-
-                uint64_t palette_index = query_block_state_id(world_x, world_y, world_z) == 0 ? 0u : 1u;
+                uint64_t palette_index = (uint64_t)palette_indices[block_index];
                 packed |= palette_index << (value_index * 4);
             }
 
