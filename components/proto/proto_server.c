@@ -1,6 +1,7 @@
 #include "proto_server.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,10 @@
 
 #define PROTO_KEEPALIVE_INTERVAL_MS 5000ULL
 #define PROTO_KEEPALIVE_TIMEOUT_MS 15000ULL
+#define PROTO_HUNGER_DECAY_INTERVAL_MS 30000ULL
+#define PROTO_HEALTH_REGEN_INTERVAL_MS 5000ULL
+#define PROTO_STARVATION_DAMAGE_INTERVAL_MS 3000ULL
+#define PROTO_VOID_DAMAGE_INTERVAL_MS 600ULL
 
 typedef enum
 {
@@ -45,6 +50,10 @@ typedef enum
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
 #define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
+#define PROTO_CHUNK_UNLOAD_GRACE_MS 2000ULL
+#define PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y 16.0
+#define PROTO_MAX_Y_CLAMP_MARGIN 64.0
+#define PROTO_RECOVERY_SURFACE_OFFSET 2.0
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
@@ -87,6 +96,7 @@ static bool broadcast_packet(int source_socket_fd,
 
 static bool load_world_deltas_from_nvs(void);
 static bool persist_world_deltas_to_nvs(void);
+static void initialize_survival_state(proto_connection_t *connection, uint64_t now_ms);
 
 static void ensure_world_initialized(void)
 {
@@ -994,6 +1004,13 @@ static bool send_map_chunk_packet(int socket_fd,
         return false;
     }
 
+    if (section_mask < 0 ||
+        chunk_data_length > sizeof(s_proto_chunk_data_buffer) ||
+        chunk_data_length > (size_t)INT32_MAX)
+    {
+        return false;
+    }
+
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
@@ -1032,6 +1049,11 @@ static bool send_update_light_packet(int socket_fd,
                                      proto_send_callback_t send_fn,
                                      void *send_context)
 {
+    if (PROTO_CHUNK_LIGHT_EMPTY_MASK <= 0)
+    {
+        return false;
+    }
+
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
@@ -1042,7 +1064,9 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, 0) ||
         !proto_write_varint(&writer, 0) ||
         !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
-        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK))
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, 0))
     {
         return false;
     }
@@ -1150,6 +1174,11 @@ static bool send_packet(int socket_fd,
 {
     size_t framed_length = 0;
 
+    if (send_fn == NULL || (packet_length > 0 && packet_body == NULL))
+    {
+        return false;
+    }
+
     if (packet_length > SERVER_MAX_OUTBOUND_PACKET_SIZE)
     {
         return false;
@@ -1160,6 +1189,11 @@ static bool send_packet(int socket_fd,
                            s_proto_framed_buffer,
                            sizeof(s_proto_framed_buffer),
                            &framed_length))
+    {
+        return false;
+    }
+
+    if (framed_length == 0 || framed_length > sizeof(s_proto_framed_buffer))
     {
         return false;
     }
@@ -1383,6 +1417,25 @@ static bool send_keepalive(int socket_fd,
     return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
+static bool send_update_health_packet(int socket_fd,
+                                      const proto_connection_t *connection,
+                                      proto_send_callback_t send_fn,
+                                      void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, 0x49) ||
+        !write_f32_be(&writer, connection->health) ||
+        !proto_write_varint(&writer, connection->food_level) ||
+        !write_f32_be(&writer, connection->food_saturation))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
 static bool build_chat_packet_body(const char *message_text,
                                    int64_t uuid_most,
                                    int64_t uuid_least,
@@ -1499,8 +1552,23 @@ static void reset_chunk_stream_state(proto_connection_t *connection)
     connection->chunk_stream_initialized = false;
     connection->chunk_center_x = 0;
     connection->chunk_center_z = 0;
+    connection->has_previous_chunk_center = false;
+    connection->previous_chunk_center_x = 0;
+    connection->previous_chunk_center_z = 0;
+    connection->chunk_unload_grace_until_ms = 0;
     connection->chunk_scan_index = 0;
     connection->chunk_sent_count = 0;
+}
+
+static void initialize_survival_state(proto_connection_t *connection, uint64_t now_ms)
+{
+    connection->health = 20.0f;
+    connection->food_level = 20;
+    connection->food_saturation = 5.0f;
+    connection->next_hunger_decay_ms = now_ms + PROTO_HUNGER_DECAY_INTERVAL_MS;
+    connection->next_health_regen_ms = now_ms + PROTO_HEALTH_REGEN_INTERVAL_MS;
+    connection->next_starvation_damage_ms = now_ms + PROTO_STARVATION_DAMAGE_INTERVAL_MS;
+    connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
 }
 
 static bool is_chunk_tracked(const proto_connection_t *connection, int32_t chunk_x, int32_t chunk_z)
@@ -1529,14 +1597,15 @@ static void track_chunk(proto_connection_t *connection, int32_t chunk_x, int32_t
     connection->chunk_sent_count++;
 }
 
-static bool is_chunk_in_stream_window(const proto_connection_t *connection,
-                                      int32_t chunk_x,
-                                      int32_t chunk_z)
+static bool is_chunk_in_window(int32_t center_x,
+                               int32_t center_z,
+                               int32_t chunk_x,
+                               int32_t chunk_z)
 {
-    int32_t min_x = connection->chunk_center_x - SERVER_CHUNK_SEND_RADIUS;
-    int32_t max_x = connection->chunk_center_x + SERVER_CHUNK_SEND_RADIUS;
-    int32_t min_z = connection->chunk_center_z - SERVER_CHUNK_SEND_RADIUS;
-    int32_t max_z = connection->chunk_center_z + SERVER_CHUNK_SEND_RADIUS;
+    int32_t min_x = center_x - SERVER_CHUNK_SEND_RADIUS;
+    int32_t max_x = center_x + SERVER_CHUNK_SEND_RADIUS;
+    int32_t min_z = center_z - SERVER_CHUNK_SEND_RADIUS;
+    int32_t max_z = center_z + SERVER_CHUNK_SEND_RADIUS;
 
     return chunk_x >= min_x && chunk_x <= max_x &&
            chunk_z >= min_z && chunk_z <= max_z;
@@ -1545,15 +1614,27 @@ static bool is_chunk_in_stream_window(const proto_connection_t *connection,
 static void prune_tracked_chunks(proto_connection_t *connection,
                                  int socket_fd,
                                  proto_send_callback_t send_fn,
-                                 void *send_context)
+                                 void *send_context,
+                                 uint64_t now_ms)
 {
+    bool keep_previous_center_window = connection->has_previous_chunk_center &&
+                                       now_ms < connection->chunk_unload_grace_until_ms;
+
     uint16_t index = 0;
     while (index < connection->chunk_sent_count)
     {
         int32_t chunk_x = connection->sent_chunks[index].x;
         int32_t chunk_z = connection->sent_chunks[index].z;
 
-        if (is_chunk_in_stream_window(connection, chunk_x, chunk_z))
+        if (is_chunk_in_window(connection->chunk_center_x,
+                               connection->chunk_center_z,
+                               chunk_x,
+                               chunk_z) ||
+            (keep_previous_center_window &&
+             is_chunk_in_window(connection->previous_chunk_center_x,
+                                connection->previous_chunk_center_z,
+                                chunk_x,
+                                chunk_z)))
         {
             index++;
             continue;
@@ -1633,6 +1714,9 @@ void proto_connection_reset(proto_connection_t *connection)
     connection->yaw = 0.0f;
     connection->pitch = 0.0f;
     connection->on_ground = true;
+    connection->health = 20.0f;
+    connection->food_level = 20;
+    connection->food_saturation = 5.0f;
     reset_chunk_stream_state(connection);
 }
 
@@ -1762,6 +1846,7 @@ static void handle_login(proto_connection_t *connection,
     connection->awaiting_keepalive = false;
     connection->next_keepalive_ms = now_ms + PROTO_KEEPALIVE_INTERVAL_MS;
     connection->last_activity_ms = now_ms;
+    initialize_survival_state(connection, now_ms);
 
     if (!send_play_login(socket_fd, connection, server, send_fn, send_context) ||
         !send_initial_position(socket_fd, connection, send_fn, send_context))
@@ -1795,6 +1880,13 @@ static void handle_login(proto_connection_t *connection,
                                   send_context))
     {
         ESP_LOGW(TAG, "welcome chat send failed: user=%s", connection->username);
+        connection->close_requested = true;
+        return;
+    }
+
+    if (!send_update_health_packet(socket_fd, connection, send_fn, send_context))
+    {
+        ESP_LOGW(TAG, "initial health send failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
@@ -1964,6 +2056,22 @@ static void handle_play_chat(proto_connection_t *connection,
                         send_context);
 }
 
+static bool is_finite_coordinate(double value)
+{
+    return isfinite(value) != 0;
+}
+
+static void clamp_player_vertical_position(proto_connection_t *connection)
+{
+    ensure_world_initialized();
+
+    double max_y = (double)s_world_config.max_y + PROTO_MAX_Y_CLAMP_MARGIN;
+    if (connection->pos_y > max_y)
+    {
+        connection->pos_y = max_y;
+    }
+}
+
 static void handle_play_movement(proto_connection_t *connection,
                                  int32_t packet_id,
                                  proto_reader_t *reader)
@@ -2011,6 +2119,21 @@ static void handle_play_movement(proto_connection_t *connection,
     default:
         break;
     }
+
+    if (connection->close_requested)
+    {
+        return;
+    }
+
+    if (!is_finite_coordinate(connection->pos_x) ||
+        !is_finite_coordinate(connection->pos_y) ||
+        !is_finite_coordinate(connection->pos_z))
+    {
+        connection->close_requested = true;
+        return;
+    }
+
+    clamp_player_vertical_position(connection);
 }
 
 static bool adjust_position_for_face(int32_t *x, int32_t *y, int32_t *z, int32_t face)
@@ -2220,6 +2343,119 @@ static void handle_play(proto_connection_t *connection,
     }
 }
 
+static bool recover_player_if_out_of_world(proto_connection_t *connection,
+                                           int socket_fd,
+                                           proto_send_callback_t send_fn,
+                                           void *send_context)
+{
+    ensure_world_initialized();
+
+    double min_recovery_y = (double)s_world_config.min_y - PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y;
+    if (connection->pos_y >= min_recovery_y)
+    {
+        return true;
+    }
+
+    int32_t world_x = (int32_t)floor(connection->pos_x);
+    int32_t world_z = (int32_t)floor(connection->pos_z);
+    int16_t surface_y = world_query_surface_y(&s_world_config, world_x, world_z);
+    double fallback_y = (double)surface_y + PROTO_RECOVERY_SURFACE_OFFSET;
+    double min_safe_y = (double)s_world_config.min_y + 2.0;
+    if (fallback_y < min_safe_y)
+    {
+        fallback_y = min_safe_y;
+    }
+
+    connection->pos_y = fallback_y;
+    connection->on_ground = false;
+
+    reset_chunk_stream_state(connection);
+
+    if (!send_initial_position(socket_fd, connection, send_fn, send_context))
+    {
+        return false;
+    }
+
+    ESP_LOGW(TAG,
+             "void recovery teleport: user=%s target=(%.2f,%.2f,%.2f)",
+             connection->username[0] != '\0' ? connection->username : "(unknown)",
+             connection->pos_x,
+             connection->pos_y,
+             connection->pos_z);
+
+    return true;
+}
+
+static void tick_survival_state(proto_connection_t *connection,
+                                int socket_fd,
+                                proto_send_callback_t send_fn,
+                                void *send_context,
+                                uint64_t now_ms)
+{
+    bool health_changed = false;
+
+    ensure_world_initialized();
+
+    if (connection->food_level > 0 && now_ms >= connection->next_hunger_decay_ms)
+    {
+        connection->food_level--;
+        if (connection->food_level < 0)
+        {
+            connection->food_level = 0;
+        }
+        connection->next_hunger_decay_ms = now_ms + PROTO_HUNGER_DECAY_INTERVAL_MS;
+        health_changed = true;
+    }
+
+    if (connection->food_level >= 18 &&
+        connection->health < 20.0f &&
+        now_ms >= connection->next_health_regen_ms)
+    {
+        connection->health += 1.0f;
+        if (connection->health > 20.0f)
+        {
+            connection->health = 20.0f;
+        }
+        connection->next_health_regen_ms = now_ms + PROTO_HEALTH_REGEN_INTERVAL_MS;
+        health_changed = true;
+    }
+
+    if (connection->food_level == 0 && now_ms >= connection->next_starvation_damage_ms)
+    {
+        connection->health -= 1.0f;
+        if (connection->health < 1.0f)
+        {
+            connection->health = 1.0f;
+        }
+        connection->next_starvation_damage_ms = now_ms + PROTO_STARVATION_DAMAGE_INTERVAL_MS;
+        health_changed = true;
+    }
+
+    if (connection->pos_y < (double)(s_world_config.min_y - 1) &&
+        now_ms >= connection->next_void_damage_ms)
+    {
+        connection->health -= 2.0f;
+        if (connection->health < 1.0f)
+        {
+            connection->health = 1.0f;
+        }
+        connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
+        health_changed = true;
+    }
+
+    if (!health_changed)
+    {
+        return;
+    }
+
+    if (!send_update_health_packet(socket_fd, connection, send_fn, send_context))
+    {
+        ESP_LOGW(TAG,
+                 "health update send failed: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
+    }
+}
+
 void proto_handle_packet(proto_connection_t *connection,
                          const uint8_t *packet,
                          size_t packet_length,
@@ -2328,6 +2564,21 @@ void proto_tick_connection(proto_connection_t *connection,
         }
     }
 
+    if (!recover_player_if_out_of_world(connection, socket_fd, send_fn, send_context))
+    {
+        ESP_LOGW(TAG,
+                 "void recovery failed: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
+        connection->close_requested = true;
+        return;
+    }
+
+    if (connection->has_previous_chunk_center &&
+        now_ms >= connection->chunk_unload_grace_until_ms)
+    {
+        connection->has_previous_chunk_center = false;
+    }
+
     int32_t current_chunk_x = chunk_coord_from_position(connection->pos_x);
     int32_t current_chunk_z = chunk_coord_from_position(connection->pos_z);
 
@@ -2335,6 +2586,14 @@ void proto_tick_connection(proto_connection_t *connection,
         current_chunk_x != connection->chunk_center_x ||
         current_chunk_z != connection->chunk_center_z)
     {
+        if (connection->chunk_stream_initialized)
+        {
+            connection->has_previous_chunk_center = true;
+            connection->previous_chunk_center_x = connection->chunk_center_x;
+            connection->previous_chunk_center_z = connection->chunk_center_z;
+            connection->chunk_unload_grace_until_ms = now_ms + PROTO_CHUNK_UNLOAD_GRACE_MS;
+        }
+
         connection->chunk_stream_initialized = true;
         connection->chunk_center_x = current_chunk_x;
         connection->chunk_center_z = current_chunk_z;
@@ -2350,8 +2609,6 @@ void proto_tick_connection(proto_connection_t *connection,
                      "view position update deferred: user=%s",
                      connection->username[0] != '\0' ? connection->username : "(unknown)");
         }
-
-        prune_tracked_chunks(connection, socket_fd, send_fn, send_context);
     }
 
     for (int32_t send_index = 0; send_index < SERVER_CHUNK_SENDS_PER_TICK; send_index++)
@@ -2364,4 +2621,11 @@ void proto_tick_connection(proto_connection_t *connection,
             break;
         }
     }
+
+    if (is_chunk_tracked(connection, connection->chunk_center_x, connection->chunk_center_z))
+    {
+        prune_tracked_chunks(connection, socket_fd, send_fn, send_context, now_ms);
+    }
+
+    tick_survival_state(connection, socket_fd, send_fn, send_context, now_ms);
 }
