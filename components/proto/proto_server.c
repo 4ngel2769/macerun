@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "proto_framing.h"
+#include "proto_profile.h"
 #include "server_limits.h"
 #include "block_deltas.h"
 #include "world_query.h"
@@ -59,6 +60,7 @@ static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
 static world_config_t s_world_config;
 static world_deltas_t s_world_deltas;
+static const proto_profile_t *s_proto_profile = NULL;
 static const char *TAG = "proto_server";
 
 static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
@@ -97,6 +99,21 @@ static bool broadcast_packet(int source_socket_fd,
 static bool load_world_deltas_from_nvs(void);
 static bool persist_world_deltas_to_nvs(void);
 static void initialize_survival_state(proto_connection_t *connection, uint64_t now_ms);
+
+static const proto_profile_t *active_profile(void)
+{
+    if (s_proto_profile == NULL)
+    {
+        s_proto_profile = proto_profile_default();
+    }
+
+    return s_proto_profile;
+}
+
+static void refresh_profile(uint16_t protocol_version)
+{
+    s_proto_profile = proto_profile_for_version(protocol_version);
+}
 
 static void ensure_world_initialized(void)
 {
@@ -729,7 +746,7 @@ static bool build_block_change_packet_body(int32_t x,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x0B) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_block_change) ||
         !write_block_position(&writer, x, y, z) ||
         !proto_write_varint(&writer, block_state_id))
     {
@@ -959,7 +976,7 @@ static bool send_update_view_position_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x40) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_update_view_position) ||
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z))
     {
@@ -978,7 +995,7 @@ static bool send_unload_chunk_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x1C) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_unload_chunk) ||
         !write_i32_be(&writer, chunk_x) ||
         !write_i32_be(&writer, chunk_z))
     {
@@ -1014,7 +1031,7 @@ static bool send_map_chunk_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x20) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_chunk_data) ||
         !write_i32_be(&writer, chunk_x) ||
         !write_i32_be(&writer, chunk_z) ||
         !proto_write_u8(&writer, 1) ||
@@ -1057,16 +1074,14 @@ static bool send_update_light_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x23) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_update_light) ||
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z) ||
         !proto_write_u8(&writer, 1) ||
         !proto_write_varint(&writer, 0) ||
         !proto_write_varint(&writer, 0) ||
         !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
-        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
-        !proto_write_varint(&writer, 0) ||
-        !proto_write_varint(&writer, 0))
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK))
     {
         return false;
     }
@@ -1236,6 +1251,8 @@ static bool send_status_response(int socket_fd,
                                  proto_send_callback_t send_fn,
                                  void *send_context)
 {
+    const proto_profile_t *profile = active_profile();
+
     char escaped_motd[128];
     if (!escape_json_text(server->motd, escaped_motd, sizeof(escaped_motd)))
     {
@@ -1245,9 +1262,10 @@ static bool send_status_response(int socket_fd,
     char json[320];
     int written = snprintf(json,
                            sizeof(json),
-                           "{\"version\":{\"name\":\"1.16.5\",\"protocol\":%u},"
+                           "{\"version\":{\"name\":\"%s\",\"protocol\":%u},"
                            "\"players\":{\"max\":%u,\"online\":%u},"
                            "\"description\":{\"text\":\"%s\"}}",
+                           profile->display_name,
                            (unsigned int)server->protocol_version,
                            (unsigned int)server->max_players,
                            (unsigned int)server->online_players,
@@ -1260,7 +1278,7 @@ static bool send_status_response(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x00))
+    if (!proto_write_varint(&writer, active_profile()->s2c_status_response))
     {
         return false;
     }
@@ -1280,7 +1298,7 @@ static bool send_pong(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x01))
+    if (!proto_write_varint(&writer, active_profile()->s2c_status_pong))
     {
         return false;
     }
@@ -1313,7 +1331,7 @@ static bool send_login_disconnect(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x00))
+    if (!proto_write_varint(&writer, active_profile()->s2c_login_disconnect))
     {
         return false;
     }
@@ -1333,7 +1351,7 @@ static bool send_login_success(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x02) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_login_success) ||
         !proto_write_i64_be(&writer, connection->uuid_most) ||
         !proto_write_i64_be(&writer, connection->uuid_least) ||
         !proto_write_string(&writer, connection->username))
@@ -1353,7 +1371,7 @@ static bool send_play_login(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x24) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_join_game) ||
         !write_i32_be(&writer, connection->entity_id) ||
         !proto_write_u8(&writer, 0) ||
         !proto_write_u8(&writer, 0) ||
@@ -1385,7 +1403,7 @@ static bool send_initial_position(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x34) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_player_position_look) ||
         !write_f64_be(&writer, connection->pos_x) ||
         !write_f64_be(&writer, connection->pos_y) ||
         !write_f64_be(&writer, connection->pos_z) ||
@@ -1408,7 +1426,7 @@ static bool send_keepalive(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x1F) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_keepalive) ||
         !proto_write_i64_be(&writer, keepalive_id))
     {
         return false;
@@ -1425,7 +1443,7 @@ static bool send_update_health_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    if (!proto_write_varint(&writer, 0x49) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_update_health) ||
         !write_f32_be(&writer, connection->health) ||
         !proto_write_varint(&writer, connection->food_level) ||
         !write_f32_be(&writer, connection->food_saturation))
@@ -1459,7 +1477,7 @@ static bool build_chat_packet_body(const char *message_text,
     proto_writer_t writer;
     proto_writer_init(&writer, packet, packet_capacity);
 
-    if (!proto_write_varint(&writer, 0x0E) ||
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_chat) ||
         !proto_write_string(&writer, json) ||
         !proto_write_u8(&writer, 0) ||
         !proto_write_i64_be(&writer, uuid_most) ||
@@ -1741,11 +1759,11 @@ static void handle_handshake(proto_connection_t *connection, proto_reader_t *rea
     (void)server_address;
     (void)server_port;
 
-    if (next_state == 1)
+    if (next_state == active_profile()->handshake_next_state_status)
     {
         connection->state = PROTO_STATE_STATUS;
     }
-    else if (next_state == 2)
+    else if (next_state == active_profile()->handshake_next_state_login)
     {
         connection->state = PROTO_STATE_LOGIN;
     }
@@ -1764,7 +1782,7 @@ static void handle_status(proto_connection_t *connection,
                           proto_send_callback_t send_fn,
                           void *send_context)
 {
-    if (packet_id == 0x00)
+    if (packet_id == active_profile()->c2s_status_request)
     {
         if (!send_status_response(socket_fd, server, send_fn, send_context))
         {
@@ -1774,7 +1792,7 @@ static void handle_status(proto_connection_t *connection,
         return;
     }
 
-    if (packet_id == 0x01)
+    if (packet_id == active_profile()->c2s_status_ping)
     {
         int64_t payload = 0;
         if (!proto_read_i64_be(reader, &payload))
@@ -1809,7 +1827,7 @@ static void handle_login(proto_connection_t *connection,
                          void *send_context,
                          uint64_t now_ms)
 {
-    if (packet_id != 0x00)
+    if (packet_id != active_profile()->c2s_login_start)
     {
         ESP_LOGW(TAG, "unexpected login packet id=0x%lx", (long)packet_id);
         connection->close_requested = true;
@@ -2076,9 +2094,10 @@ static void handle_play_movement(proto_connection_t *connection,
                                  int32_t packet_id,
                                  proto_reader_t *reader)
 {
-    switch (packet_id)
+    const proto_profile_t *profile = active_profile();
+
+    if (packet_id == profile->c2s_play_position)
     {
-    case 0x12:
         if (!read_f64_be(reader, &connection->pos_x) ||
             !read_f64_be(reader, &connection->pos_y) ||
             !read_f64_be(reader, &connection->pos_z) ||
@@ -2086,9 +2105,9 @@ static void handle_play_movement(proto_connection_t *connection,
         {
             connection->close_requested = true;
         }
-        break;
-
-    case 0x13:
+    }
+    else if (packet_id == profile->c2s_play_position_look)
+    {
         if (!read_f64_be(reader, &connection->pos_x) ||
             !read_f64_be(reader, &connection->pos_y) ||
             !read_f64_be(reader, &connection->pos_z) ||
@@ -2098,26 +2117,22 @@ static void handle_play_movement(proto_connection_t *connection,
         {
             connection->close_requested = true;
         }
-        break;
-
-    case 0x14:
+    }
+    else if (packet_id == profile->c2s_play_look)
+    {
         if (!read_f32_be(reader, &connection->yaw) ||
             !read_f32_be(reader, &connection->pitch) ||
             !read_bool(reader, &connection->on_ground))
         {
             connection->close_requested = true;
         }
-        break;
-
-    case 0x15:
+    }
+    else if (packet_id == profile->c2s_play_on_ground)
+    {
         if (!read_bool(reader, &connection->on_ground))
         {
             connection->close_requested = true;
         }
-        break;
-
-    default:
-        break;
     }
 
     if (connection->close_requested)
@@ -2301,45 +2316,42 @@ static void handle_play(proto_connection_t *connection,
                         void *send_context,
                         uint64_t now_ms)
 {
+    const proto_profile_t *profile = active_profile();
+
     connection->last_activity_ms = now_ms;
 
-    switch (packet_id)
+    if (packet_id == profile->c2s_play_keepalive)
     {
-    case 0x10:
         handle_play_keepalive(connection, reader, now_ms);
-        break;
-
-    case 0x03:
+    }
+    else if (packet_id == profile->c2s_play_chat)
+    {
         handle_play_chat(connection, reader, socket_fd, send_fn, broadcast_fn, send_context);
-        break;
-
-    case 0x12:
-    case 0x13:
-    case 0x14:
-    case 0x15:
+    }
+    else if (packet_id == profile->c2s_play_position ||
+             packet_id == profile->c2s_play_position_look ||
+             packet_id == profile->c2s_play_look ||
+             packet_id == profile->c2s_play_on_ground)
+    {
         handle_play_movement(connection, packet_id, reader);
-        break;
-
-    case 0x1B:
+    }
+    else if (packet_id == profile->c2s_play_block_dig)
+    {
         handle_play_block_dig(connection,
                               reader,
                               socket_fd,
                               send_fn,
                               broadcast_fn,
                               send_context);
-        break;
-
-    case 0x2E:
+    }
+    else if (packet_id == profile->c2s_play_block_place)
+    {
         handle_play_block_place(connection,
                                 reader,
                                 socket_fd,
                                 send_fn,
                                 broadcast_fn,
                                 send_context);
-        break;
-
-    default:
-        break;
     }
 }
 
@@ -2466,6 +2478,11 @@ void proto_handle_packet(proto_connection_t *connection,
                          void *send_context,
                          uint64_t now_ms)
 {
+    if (server != NULL)
+    {
+        refresh_profile(server->protocol_version);
+    }
+
     proto_reader_t reader;
     proto_reader_init(&reader, packet, packet_length);
 
@@ -2480,7 +2497,7 @@ void proto_handle_packet(proto_connection_t *connection,
     switch (connection->state)
     {
     case PROTO_STATE_HANDSHAKE:
-        if (packet_id != 0x00)
+        if (packet_id != active_profile()->c2s_handshake)
         {
             connection->close_requested = true;
             return;
