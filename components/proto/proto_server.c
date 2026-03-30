@@ -55,7 +55,6 @@ typedef enum
 #define PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y 16.0
 #define PROTO_MAX_Y_CLAMP_MARGIN 64.0
 #define PROTO_RECOVERY_SURFACE_OFFSET 2.0
-#define PROTO_MAX_SKY_LIGHT_ARRAYS 10
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
@@ -67,8 +66,6 @@ static const char *TAG = "proto_server";
 static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
 static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
 static uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
-static uint8_t s_proto_full_sky_light_array[2048];
-static bool s_proto_full_sky_light_ready = false;
 
 static const int32_t s_chunk_palette_state_ids[] = {
     0,
@@ -1074,41 +1071,6 @@ static bool send_update_light_packet(int socket_fd,
         return false;
     }
 
-    if (!s_proto_full_sky_light_ready)
-    {
-        memset(s_proto_full_sky_light_array, 0xFF, sizeof(s_proto_full_sky_light_array));
-        s_proto_full_sky_light_ready = true;
-    }
-
-    int32_t top_section_index = s_world_config.max_y / PROTO_SECTION_HEIGHT;
-    if (top_section_index < 0)
-    {
-        top_section_index = 0;
-    }
-    if (top_section_index >= PROTO_SECTION_COUNT)
-    {
-        top_section_index = PROTO_SECTION_COUNT - 1;
-    }
-
-    int32_t sky_array_count = top_section_index + 2;
-    if (sky_array_count > PROTO_LIGHT_SECTION_COUNT)
-    {
-        sky_array_count = PROTO_LIGHT_SECTION_COUNT;
-    }
-    if (sky_array_count > PROTO_MAX_SKY_LIGHT_ARRAYS)
-    {
-        sky_array_count = PROTO_MAX_SKY_LIGHT_ARRAYS;
-    }
-    if (sky_array_count < 1)
-    {
-        sky_array_count = 1;
-    }
-
-    int32_t sky_light_mask = (1 << sky_array_count) - 1;
-    int32_t block_light_mask = 0;
-    int32_t empty_sky_light_mask = 0;
-    int32_t empty_block_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
-
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
@@ -1116,28 +1078,12 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z) ||
         !proto_write_u8(&writer, 1) ||
-        !proto_write_varint(&writer, sky_light_mask) ||
-        !proto_write_varint(&writer, block_light_mask) ||
-        !proto_write_varint(&writer, empty_sky_light_mask) ||
-        !proto_write_varint(&writer, empty_block_light_mask))
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
+        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK))
     {
         return false;
-    }
-
-    for (int32_t section = 0; section < PROTO_LIGHT_SECTION_COUNT; section++)
-    {
-        if ((sky_light_mask & (1 << section)) == 0)
-        {
-            continue;
-        }
-
-        if (!proto_write_varint(&writer, (int32_t)sizeof(s_proto_full_sky_light_array)) ||
-            !proto_write_bytes(&writer,
-                               s_proto_full_sky_light_array,
-                               sizeof(s_proto_full_sky_light_array)))
-        {
-            return false;
-        }
     }
 
     return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
@@ -1689,6 +1635,10 @@ static void prune_tracked_chunks(proto_connection_t *connection,
                                  void *send_context,
                                  uint64_t now_ms)
 {
+    (void)socket_fd;
+    (void)send_fn;
+    (void)send_context;
+
     bool keep_previous_center_window = connection->has_previous_chunk_center &&
                                        now_ms < connection->chunk_unload_grace_until_ms;
 
@@ -1708,16 +1658,6 @@ static void prune_tracked_chunks(proto_connection_t *connection,
                                 chunk_x,
                                 chunk_z)))
         {
-            index++;
-            continue;
-        }
-
-        if (!send_unload_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context))
-        {
-            ESP_LOGW(TAG,
-                     "unload chunk send failed for (%ld,%ld)",
-                     (long)chunk_x,
-                     (long)chunk_z);
             index++;
             continue;
         }
@@ -1783,8 +1723,7 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
     int32_t chosen_chunk_x = connection->chunk_center_x + chosen_dx;
     int32_t chosen_chunk_z = connection->chunk_center_z + chosen_dz;
 
-    if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context) ||
-        !send_update_light_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
+    if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
     {
         ESP_LOGW(TAG,
                  "chunk send failed at (%ld,%ld); will retry",
@@ -1956,17 +1895,6 @@ static void handle_login(proto_connection_t *connection,
     connection->chunk_center_x = chunk_coord_from_position(connection->pos_x);
     connection->chunk_center_z = chunk_coord_from_position(connection->pos_z);
     connection->chunk_stream_initialized = true;
-
-    if (!send_update_view_position_packet(socket_fd,
-                                          connection->chunk_center_x,
-                                          connection->chunk_center_z,
-                                          send_fn,
-                                          send_context))
-    {
-        ESP_LOGW(TAG, "initial view position send failed: user=%s", connection->username);
-        connection->close_requested = true;
-        return;
-    }
 
     if (!send_chat_text_to_client(socket_fd,
                                   "ESP32 server online. Movement and chat are active.",
@@ -2693,17 +2621,6 @@ void proto_tick_connection(proto_connection_t *connection,
         connection->chunk_center_x = current_chunk_x;
         connection->chunk_center_z = current_chunk_z;
         connection->chunk_scan_index = 0;
-
-        if (!send_update_view_position_packet(socket_fd,
-                                              connection->chunk_center_x,
-                                              connection->chunk_center_z,
-                                              send_fn,
-                                              send_context))
-        {
-            ESP_LOGW(TAG,
-                     "view position update deferred: user=%s",
-                     connection->username[0] != '\0' ? connection->username : "(unknown)");
-        }
     }
 
     for (int32_t send_index = 0; send_index < SERVER_CHUNK_SENDS_PER_TICK; send_index++)
