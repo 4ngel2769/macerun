@@ -2,10 +2,12 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "server_limits.h"
 
 #define WORLD_TREE_CELL_SIZE 8
+#define WORLD_DETAIL_STEP 16
 
 static int32_t floor_div(int32_t value, int32_t divisor)
 {
@@ -39,6 +41,19 @@ static uint32_t hash_xz(uint32_t seed, int32_t x, int32_t z, uint32_t salt)
 static int32_t abs_i32(int32_t value)
 {
     return value < 0 ? -value : value;
+}
+
+static int32_t interpolate_bilinear(int32_t h00,
+                                    int32_t h10,
+                                    int32_t h01,
+                                    int32_t h11,
+                                    int32_t tx,
+                                    int32_t tz,
+                                    int32_t step)
+{
+    int32_t top = h00 * (step - tx) + h10 * tx;
+    int32_t bottom = h01 * (step - tx) + h11 * tx;
+    return (top * (step - tz) + bottom * tz) / (step * step);
 }
 
 static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value)
@@ -89,30 +104,30 @@ static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, in
     uint32_t h = hash_xz(config->seed, ax, az, 0xC001D00Du);
 
     int base = config->sea_level;
-    int amplitude = 8;
-    int factors = 3;
+    int amplitude = 6;
+    int factors = 4;
 
     switch (biome)
     {
     case WORLD_BIOME_PLAINS:
-        base += 2;
-        amplitude = 6;
+        base += 3;
+        amplitude = 5;
         factors = 4;
         break;
     case WORLD_BIOME_FOREST:
-        base += 3;
-        amplitude = 10;
-        factors = 3;
+        base += 4;
+        amplitude = 9;
+        factors = 4;
         break;
     case WORLD_BIOME_DESERT:
-        base += 1;
-        amplitude = 5;
+        base += 2;
+        amplitude = 4;
         factors = 3;
         break;
     case WORLD_BIOME_SNOW:
-        base += 4;
-        amplitude = 14;
-        factors = 2;
+        base += 6;
+        amplitude = 11;
+        factors = 3;
         break;
     }
 
@@ -153,9 +168,23 @@ int16_t world_query_surface_y(const world_config_t *config, int32_t x, int32_t z
     int32_t tx = x - x0;
     int32_t tz = z - z0;
 
-    int32_t top = h00 * (step - tx) + h10 * tx;
-    int32_t bottom = h01 * (step - tx) + h11 * tx;
-    int32_t blended = (top * (step - tz) + bottom * tz) / (step * step);
+    int32_t blended = interpolate_bilinear(h00, h10, h01, h11, tx, tz, step);
+
+    int32_t detail_cell_x = floor_div(x, WORLD_DETAIL_STEP);
+    int32_t detail_cell_z = floor_div(z, WORLD_DETAIL_STEP);
+    uint32_t detail_hash = hash_xz(config->seed ^ 0xA53C1E2Du,
+                                   detail_cell_x,
+                                   detail_cell_z,
+                                   0x9E3779B9u);
+    int32_t detail = ((int32_t)(detail_hash & 0x7u)) - 3;
+
+    int32_t ridge_hash = (int32_t)((detail_hash >> 8) & 0x0Fu);
+    if (ridge_hash < 3)
+    {
+        detail += 2;
+    }
+
+    blended += detail;
 
     return clamp_i16(blended, config->min_y + 1, config->max_y);
 }
@@ -226,7 +255,7 @@ static bool query_tree_block(const world_config_t *config,
             }
 
             int32_t trunk_base_y = anchor_surface + 1;
-            int32_t trunk_height = 4 + (int32_t)((tree_hash >> 11) & 0x1u);
+            int32_t trunk_height = 4 + (int32_t)((tree_hash >> 11) & 0x3u);
             int32_t trunk_top_y = trunk_base_y + trunk_height - 1;
             if (trunk_top_y + 2 > config->max_y)
             {
@@ -245,7 +274,7 @@ static bool query_tree_block(const world_config_t *config,
                 return true;
             }
 
-            if (y < trunk_top_y - 2 || y > trunk_top_y + 1 || dx > 2 || dz > 2)
+            if (y < trunk_top_y - 2 || y > trunk_top_y + 2 || dx > 2 || dz > 2)
             {
                 continue;
             }
@@ -256,9 +285,16 @@ static bool query_tree_block(const world_config_t *config,
             }
 
             int32_t taxicab = dx + dz;
-            if (y == trunk_top_y + 1)
+            if (y == trunk_top_y + 2)
             {
                 if (taxicab > 1)
+                {
+                    continue;
+                }
+            }
+            else if (y == trunk_top_y + 1)
+            {
+                if (taxicab > 2)
                 {
                     continue;
                 }
@@ -330,19 +366,31 @@ uint8_t world_query_block(const world_config_t *config, int32_t x, int32_t y, in
         return (biome == WORLD_BIOME_DESERT) ? BLOCK_SAND : BLOCK_DIRT;
     }
 
-    int16_t cave_center = (int16_t)(config->sea_level - (surface_y - config->sea_level) - 12);
-    uint32_t cave_hash = hash_xz(config->seed ^ 0x55AA55AAu, x, z, (uint32_t)y);
-    bool carve = ((cave_hash & 0xFFu) < 20u);
+    int16_t cave_center = (int16_t)(config->sea_level - (surface_y - config->sea_level) - 14);
+    uint32_t cave_hash = hash_xz(config->seed ^ 0x55AA55AAu,
+                                 x,
+                                 z,
+                                 (uint32_t)(y * 31));
+    uint32_t cave_hash_b = hash_xz(config->seed ^ 0x33CC44DDu,
+                                   x,
+                                   z,
+                                   (uint32_t)(y * 17));
+    bool carve = ((cave_hash & 0xFFu) < 22u) && ((cave_hash_b & 0x1Fu) < 4u);
 
-    if (carve && y >= cave_center - 6 && y <= cave_center + 2)
+    if (carve && y >= cave_center - 7 && y <= cave_center + 3)
     {
         return BLOCK_AIR;
     }
 
-    uint32_t ore_hash = hash_xz(config->seed ^ 0x0DDC0FFEu, x, z, (uint32_t)(y * 13));
-    if (y < config->sea_level - 24 && (ore_hash & 0x1FFu) == 0)
+    uint32_t ore_seed = hash_xz(config->seed ^ 0x0DDC0FFEu, x, z, 0x1234ABCDu);
+    int32_t ore_y = (int32_t)(ore_seed & 0x3Fu);
+    if (y == ore_y && y < config->sea_level - 12)
     {
-        return BLOCK_DIAMOND_ORE;
+        uint32_t rarity = (ore_seed >> ((uint32_t)ore_y % 16u)) & 0xFFu;
+        if (y < 14 && rarity < 10u)
+        {
+            return BLOCK_DIAMOND_ORE;
+        }
     }
 
     return BLOCK_STONE;

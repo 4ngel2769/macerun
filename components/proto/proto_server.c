@@ -55,6 +55,7 @@ typedef enum
 #define PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y 16.0
 #define PROTO_MAX_Y_CLAMP_MARGIN 64.0
 #define PROTO_RECOVERY_SURFACE_OFFSET 2.0
+#define PROTO_MAX_SKY_LIGHT_ARRAYS 10
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
@@ -66,6 +67,8 @@ static const char *TAG = "proto_server";
 static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
 static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
 static uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
+static uint8_t s_proto_full_sky_light_array[2048];
+static bool s_proto_full_sky_light_ready = false;
 
 static const int32_t s_chunk_palette_state_ids[] = {
     0,
@@ -1071,6 +1074,41 @@ static bool send_update_light_packet(int socket_fd,
         return false;
     }
 
+    if (!s_proto_full_sky_light_ready)
+    {
+        memset(s_proto_full_sky_light_array, 0xFF, sizeof(s_proto_full_sky_light_array));
+        s_proto_full_sky_light_ready = true;
+    }
+
+    int32_t top_section_index = s_world_config.max_y / PROTO_SECTION_HEIGHT;
+    if (top_section_index < 0)
+    {
+        top_section_index = 0;
+    }
+    if (top_section_index >= PROTO_SECTION_COUNT)
+    {
+        top_section_index = PROTO_SECTION_COUNT - 1;
+    }
+
+    int32_t sky_array_count = top_section_index + 2;
+    if (sky_array_count > PROTO_LIGHT_SECTION_COUNT)
+    {
+        sky_array_count = PROTO_LIGHT_SECTION_COUNT;
+    }
+    if (sky_array_count > PROTO_MAX_SKY_LIGHT_ARRAYS)
+    {
+        sky_array_count = PROTO_MAX_SKY_LIGHT_ARRAYS;
+    }
+    if (sky_array_count < 1)
+    {
+        sky_array_count = 1;
+    }
+
+    int32_t sky_light_mask = (1 << sky_array_count) - 1;
+    int32_t block_light_mask = 0;
+    int32_t empty_sky_light_mask = 0;
+    int32_t empty_block_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
+
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
@@ -1078,12 +1116,28 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z) ||
         !proto_write_u8(&writer, 1) ||
-        !proto_write_varint(&writer, 0) ||
-        !proto_write_varint(&writer, 0) ||
-        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK) ||
-        !proto_write_varint(&writer, PROTO_CHUNK_LIGHT_EMPTY_MASK))
+        !proto_write_varint(&writer, sky_light_mask) ||
+        !proto_write_varint(&writer, block_light_mask) ||
+        !proto_write_varint(&writer, empty_sky_light_mask) ||
+        !proto_write_varint(&writer, empty_block_light_mask))
     {
         return false;
+    }
+
+    for (int32_t section = 0; section < PROTO_LIGHT_SECTION_COUNT; section++)
+    {
+        if ((sky_light_mask & (1 << section)) == 0)
+        {
+            continue;
+        }
+
+        if (!proto_write_varint(&writer, (int32_t)sizeof(s_proto_full_sky_light_array)) ||
+            !proto_write_bytes(&writer,
+                               s_proto_full_sky_light_array,
+                               sizeof(s_proto_full_sky_light_array)))
+        {
+            return false;
+        }
     }
 
     return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
@@ -1690,6 +1744,9 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
     int32_t diameter = (SERVER_CHUNK_SEND_RADIUS * 2) + 1;
     int32_t total = diameter * diameter;
 
+    int32_t best_scan_index = -1;
+    int32_t best_distance = INT32_MAX;
+
     for (int32_t attempt = 0; attempt < total; attempt++)
     {
         int32_t scan_index = (connection->chunk_scan_index + (uint16_t)attempt) % (uint16_t)total;
@@ -1703,21 +1760,42 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
             continue;
         }
 
-        if (!send_map_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context) ||
-            !send_update_light_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context))
+        int32_t distance = abs(local_dx) + abs(local_dz);
+        if (best_scan_index < 0 || distance < best_distance)
         {
-            ESP_LOGW(TAG,
-                     "chunk send failed at (%ld,%ld); will retry",
-                     (long)chunk_x,
-                     (long)chunk_z);
-            connection->chunk_scan_index = (uint16_t)((scan_index + 1) % total);
-            return true;
-        }
+            best_scan_index = scan_index;
+            best_distance = distance;
 
-        track_chunk(connection, chunk_x, chunk_z);
-        connection->chunk_scan_index = (uint16_t)((scan_index + 1) % total);
+            if (distance == 0)
+            {
+                break;
+            }
+        }
+    }
+
+    if (best_scan_index < 0)
+    {
         return true;
     }
+
+    int32_t chosen_dx = (best_scan_index % diameter) - SERVER_CHUNK_SEND_RADIUS;
+    int32_t chosen_dz = (best_scan_index / diameter) - SERVER_CHUNK_SEND_RADIUS;
+    int32_t chosen_chunk_x = connection->chunk_center_x + chosen_dx;
+    int32_t chosen_chunk_z = connection->chunk_center_z + chosen_dz;
+
+    if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context) ||
+        !send_update_light_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
+    {
+        ESP_LOGW(TAG,
+                 "chunk send failed at (%ld,%ld); will retry",
+                 (long)chosen_chunk_x,
+                 (long)chosen_chunk_z);
+        connection->chunk_scan_index = (uint16_t)((best_scan_index + 1) % total);
+        return true;
+    }
+
+    track_chunk(connection, chosen_chunk_x, chosen_chunk_z);
+    connection->chunk_scan_index = (uint16_t)((best_scan_index + 1) % total);
 
     return true;
 }
