@@ -19,6 +19,8 @@ static const proto_profile_t PROFILE_754 = {
     .c2s_play_position_look = 0x13,
     .c2s_play_look = 0x14,
     .c2s_play_on_ground = 0x15,
+    .c2s_play_use_entity = 0x0E,
+    .c2s_play_arm_animation = 0x2C,
     .c2s_play_block_dig = 0x1B,
     .c2s_play_block_place = 0x2E,
 
@@ -27,6 +29,7 @@ static const proto_profile_t PROFILE_754 = {
     .s2c_login_disconnect = 0x00,
     .s2c_login_success = 0x02,
     .s2c_play_chat = 0x0E,
+    .s2c_play_entity_animation = 0x05,
     .s2c_play_block_change = 0x0B,
     .s2c_play_chunk_data = 0x20,
     .s2c_play_update_light = 0x23,
@@ -35,7 +38,16 @@ static const proto_profile_t PROFILE_754 = {
     .s2c_play_join_game = 0x24,
     .s2c_play_player_position_look = 0x34,
     .s2c_play_update_view_position = 0x40,
+    .s2c_play_set_slot = 0x15,
     .s2c_play_update_health = 0x49,
+
+    .s2c_play_player_info      = 0x32,
+    .s2c_play_spawn_player     = 0x04,
+    .s2c_play_entity_position  = 0x27,
+    .s2c_play_entity_pos_rot   = 0x28,
+    .s2c_play_entity_rotation  = 0x29,
+    .s2c_play_entity_head_look = 0x3A,
+    .s2c_play_destroy_entities = 0x36,
 
     .supports_light_trust_edges = true,
 };

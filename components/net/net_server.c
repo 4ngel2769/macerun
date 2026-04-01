@@ -19,6 +19,8 @@
 #include "proto_server.h"
 #include "server_limits.h"
 
+#define NET_ATTACK_COOLDOWN_MS 500ULL
+
 typedef struct
 {
     bool in_use;
@@ -80,6 +82,20 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
 
     size_t sent = 0;
     uint32_t stalled_retries = 0;
+    uint32_t max_stalled_retries = SERVER_SOCKET_SEND_STALL_RETRIES * 5;
+
+    if (length > 2048)
+    {
+        uint32_t scaled_retries = (uint32_t)(length / 4);
+        if (scaled_retries > max_stalled_retries)
+        {
+            max_stalled_retries = scaled_retries;
+        }
+        if (max_stalled_retries > 8000)
+        {
+            max_stalled_retries = 8000;
+        }
+    }
 
     while (sent < length)
     {
@@ -94,8 +110,14 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
             stalled_retries++;
-            if (stalled_retries > SERVER_SOCKET_SEND_STALL_RETRIES)
+            if (stalled_retries > max_stalled_retries)
             {
+                ESP_LOGW(TAG,
+                         "send stalled: fd=%d sent=%u/%u retries=%u",
+                         socket_fd,
+                         (unsigned int)sent,
+                         (unsigned int)length,
+                         (unsigned int)stalled_retries);
                 return false;
             }
 
@@ -108,9 +130,22 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
             continue;
         }
 
-        if (result == 0)
+        if (result < 0)
         {
-            return false;
+            ESP_LOGW(TAG,
+                     "send failed: fd=%d sent=%u/%u errno=%d",
+                     socket_fd,
+                     (unsigned int)sent,
+                     (unsigned int)length,
+                     errno);
+        }
+        else
+        {
+            ESP_LOGW(TAG,
+                     "send returned zero: fd=%d sent=%u/%u",
+                     socket_fd,
+                     (unsigned int)sent,
+                     (unsigned int)length);
         }
 
         return false;
@@ -119,28 +154,54 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
     return true;
 }
 
-static void close_client_with_reason(net_client_t *client, const char *reason)
+static void close_client_with_reason(net_server_state_t *server,
+                                     net_client_t *client,
+                                     const char *reason)
 {
     if (!client->in_use)
     {
         return;
     }
 
+    if (client->protocol.joined_play)
+    {
+        for (size_t k = 0; k < SERVER_MAX_PLAYERS; k++)
+        {
+            net_client_t *peer = &server->clients[k];
+            if (peer == client)
+            {
+                continue;
+            }
+            if (!peer->in_use)
+            {
+                continue;
+            }
+            if (!peer->protocol.joined_play)
+            {
+                continue;
+            }
+            if (peer->protocol.state != PROTO_STATE_PLAY)
+            {
+                continue;
+            }
+
+            proto_send_player_remove(peer->socket_fd,
+                                     &client->protocol,
+                                     socket_send_all,
+                                     server);
+        }
+    }
+
     const char *safe_reason = (reason != NULL) ? reason : "unspecified";
     if (client->protocol.username[0] != '\0')
     {
-        ESP_LOGW(TAG,
-                 "client disconnected: user=%s fd=%d reason=%s",
-                 client->protocol.username,
-                 client->socket_fd,
-                 safe_reason);
+        ESP_LOGW(TAG, "client disconnected: user=%s fd=%d reason=%s",
+                 client->protocol.username, client->socket_fd, safe_reason);
     }
     else
     {
-        ESP_LOGW(TAG,
-                 "client disconnected: fd=%d reason=%s",
-                 client->socket_fd,
-                 safe_reason);
+        ESP_LOGW(TAG, "client disconnected: fd=%d reason=%s",
+                 client->socket_fd, safe_reason);
     }
 
     close(client->socket_fd);
@@ -168,7 +229,10 @@ static bool socket_broadcast_except(void *context,
 
         if (!socket_send_all(server, client->socket_fd, data, length))
         {
-            close_client_with_reason(client, "broadcast send failed");
+            ESP_LOGW(TAG,
+                     "broadcast delivery failed: fd=%d len=%u",
+                     client->socket_fd,
+                     (unsigned int)length);
             all_sent = false;
         }
     }
@@ -182,6 +246,121 @@ static void fill_server_info(const net_server_state_t *server, proto_server_info
     server_info->max_players = server->config.max_players;
     server_info->online_players = (uint8_t)count_online_players(server);
     snprintf(server_info->motd, sizeof(server_info->motd), "%s", server->config.motd);
+}
+
+static net_client_t *find_client_by_entity_id(net_server_state_t *server, int32_t entity_id)
+{
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *client = &server->clients[i];
+        if (!client->in_use ||
+            !client->protocol.joined_play ||
+            client->protocol.state != PROTO_STATE_PLAY)
+        {
+            continue;
+        }
+
+        if (client->protocol.entity_id == entity_id)
+        {
+            return client;
+        }
+    }
+
+    return NULL;
+}
+
+static void broadcast_entity_animation(net_server_state_t *server,
+                                       int32_t entity_id,
+                                       uint8_t animation_id)
+{
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *observer = &server->clients[i];
+        if (!observer->in_use ||
+            !observer->protocol.joined_play ||
+            observer->protocol.state != PROTO_STATE_PLAY)
+        {
+            continue;
+        }
+
+        if (!proto_send_entity_animation(observer->socket_fd,
+                                         entity_id,
+                                         animation_id,
+                                         socket_send_all,
+                                         server))
+        {
+            ESP_LOGW(TAG,
+                     "entity animation delivery failed: fd=%d entity=%ld anim=%u",
+                     observer->socket_fd,
+                     (long)entity_id,
+                     (unsigned int)animation_id);
+        }
+    }
+}
+
+static void process_pending_interaction_events(net_server_state_t *server,
+                                               net_client_t *client,
+                                               uint64_t now_ms)
+{
+    if (!client->in_use ||
+        !client->protocol.joined_play ||
+        client->protocol.state != PROTO_STATE_PLAY)
+    {
+        return;
+    }
+
+    if (client->protocol.pending_swing_animation)
+    {
+        broadcast_entity_animation(server, client->protocol.entity_id, 0);
+        client->protocol.pending_swing_animation = false;
+    }
+
+    if (!client->protocol.pending_attack_event)
+    {
+        return;
+    }
+
+    int32_t target_entity_id = client->protocol.pending_attack_target_entity_id;
+    client->protocol.pending_attack_event = false;
+    client->protocol.pending_attack_target_entity_id = 0;
+
+    if (target_entity_id == client->protocol.entity_id)
+    {
+        return;
+    }
+
+    if (now_ms < client->protocol.next_attack_allowed_ms)
+    {
+        return;
+    }
+
+    client->protocol.next_attack_allowed_ms = now_ms + NET_ATTACK_COOLDOWN_MS;
+
+    net_client_t *target = find_client_by_entity_id(server, target_entity_id);
+    if (target == NULL)
+    {
+        return;
+    }
+
+    if (target->protocol.health > 1.0f)
+    {
+        target->protocol.health -= 1.0f;
+        if (target->protocol.health < 1.0f)
+        {
+            target->protocol.health = 1.0f;
+        }
+    }
+
+    if (!proto_send_health_update(target->socket_fd,
+                                  &target->protocol,
+                                  socket_send_all,
+                                  server))
+    {
+        ESP_LOGW(TAG,
+                 "health update delivery failed: target_fd=%d target_entity=%ld",
+                 target->socket_fd,
+                 (long)target->protocol.entity_id);
+    }
 }
 
 static void accept_new_clients(net_server_state_t *server)
@@ -219,10 +398,7 @@ static void accept_new_clients(net_server_state_t *server)
                 server->clients[i].stream_length = 0;
                 proto_connection_reset(&server->clients[i].protocol);
                 assigned = true;
-                ESP_LOGW(TAG,
-                         "client connected: slot=%u fd=%d",
-                         (unsigned int)i,
-                         client_fd);
+                ESP_LOGW(TAG, "client connected: slot=%u fd=%d", (unsigned int)i, client_fd);
                 break;
             }
         }
@@ -235,7 +411,9 @@ static void accept_new_clients(net_server_state_t *server)
     }
 }
 
-static void process_stream_packets(net_server_state_t *server, net_client_t *client, uint64_t now_ms)
+static void process_stream_packets(net_server_state_t *server,
+                                   net_client_t *client,
+                                   uint64_t now_ms)
 {
     uint8_t packet[SERVER_MAX_INBOUND_PACKET_SIZE];
     size_t packet_length = 0;
@@ -256,7 +434,7 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
         if (result == PROTO_EXTRACT_ERROR)
         {
             ESP_LOGW(TAG, "invalid packet framing, disconnecting client");
-            close_client_with_reason(client, "invalid packet framing");
+            close_client_with_reason(server, client, "invalid packet framing");
             return;
         }
 
@@ -281,17 +459,57 @@ static void process_stream_packets(net_server_state_t *server, net_client_t *cli
                      "player joined: user=%s fd=%d",
                      client->protocol.username[0] != '\0' ? client->protocol.username : "(unknown)",
                      client->socket_fd);
+
+            for (size_t j = 0; j < SERVER_MAX_PLAYERS; j++)
+            {
+                net_client_t *peer = &server->clients[j];
+
+                if (peer == client)
+                {
+                    continue;
+                }
+                if (!peer->in_use)
+                {
+                    continue;
+                }
+                if (!peer->protocol.joined_play)
+                {
+                    continue;
+                }
+                if (peer->protocol.state != PROTO_STATE_PLAY)
+                {
+                    continue;
+                }
+
+                proto_send_player_presence(client->socket_fd,
+                                           &peer->protocol,
+                                           socket_send_all,
+                                           server);
+
+                proto_send_player_presence(peer->socket_fd,
+                                           &client->protocol,
+                                           socket_send_all,
+                                           server);
+            }
+
+            client->protocol.prev_pos_x = client->protocol.pos_x;
+            client->protocol.prev_pos_y = client->protocol.pos_y;
+            client->protocol.prev_pos_z = client->protocol.pos_z;
         }
+
+        process_pending_interaction_events(server, client, now_ms);
 
         if (client->protocol.close_requested)
         {
-            close_client_with_reason(client, "protocol requested close");
+            close_client_with_reason(server, client, "protocol requested close");
             return;
         }
     }
 }
 
-static void process_client_rx(net_server_state_t *server, net_client_t *client, uint64_t now_ms)
+static void process_client_rx(net_server_state_t *server,
+                              net_client_t *client,
+                              uint64_t now_ms)
 {
     uint8_t rx_tmp[512];
 
@@ -304,7 +522,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
             if (client->stream_length + incoming > sizeof(client->stream_buffer))
             {
                 ESP_LOGW(TAG, "stream buffer overflow; disconnecting client");
-                close_client_with_reason(client, "stream buffer overflow");
+                close_client_with_reason(server, client, "stream buffer overflow");
                 return;
             }
 
@@ -316,7 +534,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
 
         if (received == 0)
         {
-            close_client_with_reason(client, "peer closed connection");
+            close_client_with_reason(server, client, "peer closed connection");
             return;
         }
 
@@ -326,7 +544,7 @@ static void process_client_rx(net_server_state_t *server, net_client_t *client, 
         }
 
         ESP_LOGW(TAG, "recv failed, disconnecting client: errno=%d", errno);
-        close_client_with_reason(client, "recv error");
+        close_client_with_reason(server, client, "recv error");
         return;
     }
 }
@@ -414,9 +632,64 @@ static void server_task(void *arg)
 
                 if (server->clients[i].protocol.close_requested)
                 {
-                    close_client_with_reason(&server->clients[i], "tick requested close");
+                    close_client_with_reason(server, &server->clients[i], "tick requested close");
                 }
             }
+        }
+
+        for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+        {
+            net_client_t *mover = &server->clients[i];
+            if (!mover->in_use)
+            {
+                continue;
+            }
+            if (!mover->protocol.joined_play)
+            {
+                continue;
+            }
+            if (mover->protocol.state != PROTO_STATE_PLAY)
+            {
+                continue;
+            }
+
+            double dx = mover->protocol.pos_x - mover->protocol.prev_pos_x;
+            double dy = mover->protocol.pos_y - mover->protocol.prev_pos_y;
+            double dz = mover->protocol.pos_z - mover->protocol.prev_pos_z;
+            bool moved = (dx * dx + dy * dy + dz * dz) > 1e-8;
+
+            if (moved)
+            {
+                for (size_t j = 0; j < SERVER_MAX_PLAYERS; j++)
+                {
+                    net_client_t *observer = &server->clients[j];
+                    if (observer == mover)
+                    {
+                        continue;
+                    }
+                    if (!observer->in_use)
+                    {
+                        continue;
+                    }
+                    if (!observer->protocol.joined_play)
+                    {
+                        continue;
+                    }
+                    if (observer->protocol.state != PROTO_STATE_PLAY)
+                    {
+                        continue;
+                    }
+
+                    proto_send_entity_pos_rot(observer->socket_fd,
+                                              &mover->protocol,
+                                              socket_send_all,
+                                              server);
+                }
+            }
+
+            mover->protocol.prev_pos_x = mover->protocol.pos_x;
+            mover->protocol.prev_pos_y = mover->protocol.pos_y;
+            mover->protocol.prev_pos_z = mover->protocol.pos_z;
         }
 
         server->uptime_ms += SERVER_TICK_MS;
@@ -426,7 +699,7 @@ static void server_task(void *arg)
 
     for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
     {
-        close_client_with_reason(&server->clients[i], "server stopping");
+        close_client_with_reason(server, &server->clients[i], "server stopping");
     }
 
     if (server->listen_fd >= 0)
@@ -463,11 +736,8 @@ esp_err_t net_server_broadcast_chat(const char *message)
 
     uint8_t framed_packet[SERVER_MAX_INBOUND_PACKET_SIZE + 8];
     size_t framed_packet_length = 0;
-    if (!proto_build_chat_packet(message,
-                                 0,
-                                 0,
-                                 framed_packet,
-                                 sizeof(framed_packet),
+    if (!proto_build_chat_packet(message, 0, 0,
+                                 framed_packet, sizeof(framed_packet),
                                  &framed_packet_length))
     {
         return ESP_FAIL;
@@ -487,13 +757,17 @@ esp_err_t net_server_broadcast_chat(const char *message)
         }
 
         any_client = true;
-        if (socket_send_all(&s_server, client->socket_fd, framed_packet, framed_packet_length))
+        if (socket_send_all(&s_server, client->socket_fd,
+                            framed_packet, framed_packet_length))
         {
             delivered = true;
         }
         else
         {
-            close_client_with_reason(client, "chat broadcast send failed");
+            ESP_LOGW(TAG,
+                     "chat broadcast delivery failed: fd=%d len=%u",
+                     client->socket_fd,
+                     (unsigned int)framed_packet_length);
         }
     }
 

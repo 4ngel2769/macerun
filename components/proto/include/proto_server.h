@@ -36,6 +36,13 @@ typedef struct
     double pos_x;
     double pos_y;
     double pos_z;
+    double prev_pos_x;
+    double prev_pos_y;
+    double prev_pos_z;
+    bool pending_swing_animation;
+    bool pending_attack_event;
+    int32_t pending_attack_target_entity_id;
+    uint64_t next_attack_allowed_ms;
     float yaw;
     float pitch;
     float health;
@@ -56,6 +63,8 @@ typedef struct
     uint16_t chunk_scan_index;
     uint16_t chunk_sent_count;
     proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];
+    uint16_t inventory_item_ids[46];
+    uint8_t inventory_item_counts[46];
     char username[17];
 } proto_connection_t;
 
@@ -102,3 +111,29 @@ bool proto_build_chat_packet(const char *message_text,
                              uint8_t *framed_packet_out,
                              size_t framed_packet_capacity,
                              size_t *framed_packet_length);
+
+bool proto_send_player_presence(int socket_fd,
+                                const proto_connection_t *player,
+                                proto_send_callback_t send_fn,
+                                void *send_context);
+
+bool proto_send_player_remove(int socket_fd,
+                              const proto_connection_t *player,
+                              proto_send_callback_t send_fn,
+                              void *send_context);
+
+bool proto_send_entity_pos_rot(int socket_fd,
+                               const proto_connection_t *player,
+                               proto_send_callback_t send_fn,
+                               void *send_context);
+
+bool proto_send_entity_animation(int socket_fd,
+                                 int32_t entity_id,
+                                 uint8_t animation_id,
+                                 proto_send_callback_t send_fn,
+                                 void *send_context);
+
+bool proto_send_health_update(int socket_fd,
+                              const proto_connection_t *player,
+                              proto_send_callback_t send_fn,
+                              void *send_context);
