@@ -98,8 +98,28 @@ world_biome_t world_query_biome(const world_config_t *config, int32_t x, int32_t
     }
 }
 
+#define ANCHOR_CACHE_SIZE 64
+
+typedef struct {
+    uint32_t seed;
+    int32_t ax;
+    int32_t az;
+    int16_t height;
+    bool valid;
+} anchor_cache_entry_t;
+
+static anchor_cache_entry_t s_anchor_cache[ANCHOR_CACHE_SIZE];
+
 static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, int32_t az)
 {
+    uint32_t cache_idx = ((uint32_t)(ax * 73856093) ^ (uint32_t)(az * 19349663)) & (ANCHOR_CACHE_SIZE - 1);
+    anchor_cache_entry_t *entry = &s_anchor_cache[cache_idx];
+    
+    if (entry->valid && entry->seed == config->seed && entry->ax == ax && entry->az == az)
+    {
+        return entry->height;
+    }
+
     world_biome_t biome = world_query_biome(config, ax, az);
     uint32_t h = hash_xz(config->seed, ax, az, 0xC001D00Du);
 
@@ -139,6 +159,23 @@ static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, in
 
     int max_sum = factors * 15;
     int delta = ((sum * (2 * amplitude + 1)) / max_sum) - amplitude;
+
+    int32_t detail_cell_x = floor_div(ax, WORLD_DETAIL_STEP);
+    int32_t detail_cell_z = floor_div(az, WORLD_DETAIL_STEP);
+    uint32_t detail_hash = hash_xz(config->seed ^ 0xA53C1E2Du,
+                                   detail_cell_x,
+                                   detail_cell_z,
+                                   0x9E3779B9u);
+    int32_t detail = ((int32_t)(detail_hash & 0x7u)) - 3;
+
+    int32_t ridge_hash = (int32_t)((detail_hash >> 8) & 0x0Fu);
+    if (ridge_hash < 3)
+    {
+        detail += 2;
+    }
+
+    delta += detail;
+
     int height = base + delta;
 
     if (biome == WORLD_BIOME_DESERT && height < config->sea_level)
@@ -146,7 +183,15 @@ static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, in
         height = config->sea_level;
     }
 
-    return clamp_i16(height, config->min_y + 1, config->max_y);
+    int16_t final_height = clamp_i16(height, config->min_y + 1, config->max_y);
+    
+    entry->valid = true;
+    entry->seed = config->seed;
+    entry->ax = ax;
+    entry->az = az;
+    entry->height = final_height;
+
+    return final_height;
 }
 
 int16_t world_query_surface_y(const world_config_t *config, int32_t x, int32_t z)
@@ -169,22 +214,6 @@ int16_t world_query_surface_y(const world_config_t *config, int32_t x, int32_t z
     int32_t tz = z - z0;
 
     int32_t blended = interpolate_bilinear(h00, h10, h01, h11, tx, tz, step);
-
-    int32_t detail_cell_x = floor_div(x, WORLD_DETAIL_STEP);
-    int32_t detail_cell_z = floor_div(z, WORLD_DETAIL_STEP);
-    uint32_t detail_hash = hash_xz(config->seed ^ 0xA53C1E2Du,
-                                   detail_cell_x,
-                                   detail_cell_z,
-                                   0x9E3779B9u);
-    int32_t detail = ((int32_t)(detail_hash & 0x7u)) - 3;
-
-    int32_t ridge_hash = (int32_t)((detail_hash >> 8) & 0x0Fu);
-    if (ridge_hash < 3)
-    {
-        detail += 2;
-    }
-
-    blended += detail;
 
     return clamp_i16(blended, config->min_y + 1, config->max_y);
 }

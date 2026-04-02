@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_attr.h"
@@ -53,16 +55,20 @@ typedef enum
 #define PROTO_CHUNK_BITS_PER_BLOCK 4
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
+#define PROTO_INVENTORY_NVS_KEY_PREFIX "inv_"
 #define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
 #define PROTO_CHUNK_UNLOAD_GRACE_MS 2000ULL
 #define PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y 16.0
 #define PROTO_MAX_Y_CLAMP_MARGIN 64.0
 #define PROTO_RECOVERY_SURFACE_OFFSET 2.0
+#define PROTO_SWING_COOLDOWN_MS 125ULL
 #define PROTO_INVENTORY_SLOT_MAIN_FIRST 9
 #define PROTO_INVENTORY_SLOT_MAIN_LAST 35
 #define PROTO_INVENTORY_SLOT_HOTBAR_FIRST 36
 #define PROTO_INVENTORY_SLOT_HOTBAR_LAST 44
 #define PROTO_ITEM_STACK_DEFAULT 64
+#define PROTO_ITEM_OAK_PLANKS 16
+#define PROTO_ITEM_STICK 32
 #define PROTO_ITEM_DIRT 9
 #define PROTO_ITEM_COBBLESTONE 14
 #define PROTO_ITEM_SAND 30
@@ -116,6 +122,8 @@ static bool broadcast_packet(int source_socket_fd,
 static bool load_world_deltas_from_nvs(void);
 static bool persist_world_deltas_to_nvs(void);
 static void initialize_survival_state(proto_connection_t *connection, uint64_t now_ms);
+static bool load_player_inventory_from_nvs(proto_connection_t *connection);
+static bool persist_player_inventory_to_nvs(const proto_connection_t *connection);
 
 static const proto_profile_t *active_profile(void)
 {
@@ -727,6 +735,137 @@ static bool persist_world_deltas_to_nvs(void)
     return true;
 }
 
+typedef struct
+{
+    uint16_t item_ids[46];
+    uint8_t item_counts[46];
+    uint8_t selected_hotbar_slot;
+} proto_inventory_blob_t;
+
+static uint32_t username_hash_djb2(const char *username)
+{
+    uint32_t hash = 5381u;
+    while (username != NULL && *username != '\0')
+    {
+        hash = ((hash << 5) + hash) ^ (uint8_t)(*username);
+        username++;
+    }
+    return hash;
+}
+
+static bool inventory_nvs_key_for_username(const char *username,
+                                           char *key_out,
+                                           size_t key_out_size)
+{
+    if (username == NULL || username[0] == '\0' || key_out == NULL || key_out_size < 13)
+    {
+        return false;
+    }
+
+    uint32_t hash = username_hash_djb2(username);
+    int written = snprintf(key_out,
+                           key_out_size,
+                           PROTO_INVENTORY_NVS_KEY_PREFIX "%08lx",
+                           (unsigned long)hash);
+    return written > 0 && written < (int)key_out_size;
+}
+
+static bool load_player_inventory_from_nvs(proto_connection_t *connection)
+{
+    if (connection == NULL || connection->username[0] == '\0')
+    {
+        return false;
+    }
+
+    char key[16];
+    if (!inventory_nvs_key_for_username(connection->username, key, sizeof(key)))
+    {
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return false;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "inventory nvs_open(read) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    proto_inventory_blob_t blob;
+    size_t blob_size = sizeof(blob);
+    err = nvs_get_blob(handle, key, &blob, &blob_size);
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return false;
+    }
+
+    if (err != ESP_OK || blob_size != sizeof(blob))
+    {
+        ESP_LOGW(TAG, "inventory restore failed for user=%s: %s",
+                 connection->username,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    memcpy(connection->inventory_item_ids, blob.item_ids, sizeof(connection->inventory_item_ids));
+    memcpy(connection->inventory_item_counts, blob.item_counts, sizeof(connection->inventory_item_counts));
+    connection->selected_hotbar_slot = (blob.selected_hotbar_slot <= 8) ? blob.selected_hotbar_slot : 0;
+    connection->inventory_dirty = false;
+    return true;
+}
+
+static bool persist_player_inventory_to_nvs(const proto_connection_t *connection)
+{
+    if (connection == NULL || connection->username[0] == '\0')
+    {
+        return false;
+    }
+
+    char key[16];
+    if (!inventory_nvs_key_for_username(connection->username, key, sizeof(key)))
+    {
+        return false;
+    }
+
+    proto_inventory_blob_t blob;
+    memcpy(blob.item_ids, connection->inventory_item_ids, sizeof(blob.item_ids));
+    memcpy(blob.item_counts, connection->inventory_item_counts, sizeof(blob.item_counts));
+    blob.selected_hotbar_slot = connection->selected_hotbar_slot;
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "inventory nvs_open(write) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_blob(handle, key, &blob, sizeof(blob));
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG,
+                 "inventory persist failed for user=%s: %s",
+                 connection->username,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
 static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
 {
     uint8_t block_id = query_block_id(x, y, z);
@@ -763,6 +902,167 @@ static bool send_set_slot_packet(int socket_fd,
     }
 
     return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_inventory_slot_update(int socket_fd,
+                                       int16_t slot,
+                                       const proto_connection_t *connection,
+                                       proto_send_callback_t send_fn,
+                                       void *send_context)
+{
+    if (slot < 0 || slot > 45)
+    {
+        return false;
+    }
+
+    return send_set_slot_packet(socket_fd,
+                                0,
+                                slot,
+                                connection->inventory_item_ids[slot],
+                                connection->inventory_item_counts[slot],
+                                send_fn,
+                                send_context);
+}
+
+static bool send_cursor_update(int socket_fd,
+                               const proto_connection_t *connection,
+                               proto_send_callback_t send_fn,
+                               void *send_context)
+{
+    return send_set_slot_packet(socket_fd,
+                                -1,
+                                -1,
+                                connection->cursor_item_id,
+                                connection->cursor_item_count,
+                                send_fn,
+                                send_context);
+}
+
+static bool send_inventory_snapshot(int socket_fd,
+                                    const proto_connection_t *connection,
+                                    proto_send_callback_t send_fn,
+                                    void *send_context)
+{
+    for (int16_t slot = 0; slot <= 45; slot++)
+    {
+        if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context))
+        {
+            return false;
+        }
+    }
+
+    return send_cursor_update(socket_fd, connection, send_fn, send_context);
+}
+
+typedef struct
+{
+    uint16_t item_id;
+    uint8_t count;
+} proto_crafting_result_t;
+
+static proto_crafting_result_t evaluate_player_crafting_result(const proto_connection_t *connection)
+{
+    proto_crafting_result_t result = {0};
+
+    uint8_t occupied_count = 0;
+    int8_t single_slot_index = -1;
+    uint8_t plank_slot_count = 0;
+    for (uint8_t slot = 1; slot <= 4; slot++)
+    {
+        if (connection->inventory_item_counts[slot] > 0)
+        {
+            occupied_count++;
+            single_slot_index = (int8_t)slot;
+            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_PLANKS)
+            {
+                plank_slot_count++;
+            }
+        }
+    }
+
+    if (occupied_count == 1 && single_slot_index >= 0)
+    {
+        uint16_t ingredient = connection->inventory_item_ids[(uint8_t)single_slot_index];
+        if (ingredient == PROTO_ITEM_OAK_LOG)
+        {
+            result.item_id = PROTO_ITEM_OAK_PLANKS;
+            result.count = 4;
+        }
+    }
+    else if (occupied_count == 2 && plank_slot_count == 2)
+    {
+        result.item_id = PROTO_ITEM_STICK;
+        result.count = 4;
+    }
+
+    return result;
+}
+
+static void consume_player_crafting_ingredients(proto_connection_t *connection)
+{
+    proto_crafting_result_t output = evaluate_player_crafting_result(connection);
+    if (output.count == 0)
+    {
+        return;
+    }
+
+    if (output.item_id == PROTO_ITEM_OAK_PLANKS)
+    {
+        for (uint8_t slot = 1; slot <= 4; slot++)
+        {
+            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_LOG &&
+                connection->inventory_item_counts[slot] > 0)
+            {
+                connection->inventory_item_counts[slot]--;
+                if (connection->inventory_item_counts[slot] == 0)
+                {
+                    connection->inventory_item_ids[slot] = 0;
+                }
+                break;
+            }
+        }
+    }
+    else if (output.item_id == PROTO_ITEM_STICK)
+    {
+        uint8_t consumed = 0;
+        for (uint8_t slot = 1; slot <= 4; slot++)
+        {
+            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_PLANKS &&
+                connection->inventory_item_counts[slot] > 0 &&
+                consumed < 2)
+            {
+                connection->inventory_item_counts[slot]--;
+                if (connection->inventory_item_counts[slot] == 0)
+                {
+                    connection->inventory_item_ids[slot] = 0;
+                }
+                consumed++;
+            }
+        }
+    }
+}
+
+static bool sync_player_crafting_slots(int socket_fd,
+                                       const proto_connection_t *connection,
+                                       proto_send_callback_t send_fn,
+                                       void *send_context)
+{
+    for (int16_t slot = 1; slot <= 4; slot++)
+    {
+        if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context))
+        {
+            return false;
+        }
+    }
+
+    proto_crafting_result_t output = evaluate_player_crafting_result(connection);
+    return send_set_slot_packet(socket_fd,
+                                0,
+                                0,
+                                output.item_id,
+                                output.count,
+                                send_fn,
+                                send_context);
 }
 
 static uint8_t find_inventory_stack_slot(const proto_connection_t *connection,
@@ -859,6 +1159,14 @@ static bool give_inventory_item(proto_connection_t *connection,
         {
             return false;
         }
+    }
+
+    connection->inventory_dirty = true;
+    if (!persist_player_inventory_to_nvs(connection))
+    {
+        ESP_LOGW(TAG,
+                 "inventory persist deferred after grant: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
     }
 
     return true;
@@ -1256,8 +1564,6 @@ static bool send_update_light_packet(int socket_fd,
     int32_t block_light_mask = 0;
     int32_t empty_sky_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
     int32_t empty_block_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
-    int32_t sky_light_array_count = 0;
-    int32_t block_light_array_count = 0;
 
     if (!proto_write_varint(&writer, active_profile()->s2c_play_update_light) ||
         !proto_write_varint(&writer, chunk_x) ||
@@ -1266,9 +1572,7 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, sky_light_mask) ||
         !proto_write_varint(&writer, block_light_mask) ||
         !proto_write_varint(&writer, empty_sky_light_mask) ||
-        !proto_write_varint(&writer, empty_block_light_mask) ||
-        !proto_write_varint(&writer, sky_light_array_count) ||
-        !proto_write_varint(&writer, block_light_array_count))
+        !proto_write_varint(&writer, empty_block_light_mask))
     {
         ESP_LOGW(TAG,
                  "light packet write failed at (%ld,%ld)",
@@ -2166,6 +2470,9 @@ void proto_connection_reset(proto_connection_t *connection)
     connection->health = 20.0f;
     connection->food_level = 20;
     connection->food_saturation = 5.0f;
+    connection->selected_hotbar_slot = 0;
+    connection->next_swing_allowed_ms = 0;
+    connection->inventory_dirty = false;
     reset_chunk_stream_state(connection);
 }
 
@@ -2313,10 +2620,20 @@ static void handle_login(proto_connection_t *connection,
     connection->last_activity_ms = now_ms;
     initialize_survival_state(connection, now_ms);
 
+    load_player_inventory_from_nvs(connection);
+
     if (!send_play_login(socket_fd, connection, server, send_fn, send_context) ||
         !send_initial_position(socket_fd, connection, send_fn, send_context))
     {
         ESP_LOGW(TAG, "play init packet send failed: user=%s", connection->username);
+        connection->close_requested = true;
+        return;
+    }
+
+    if (!send_inventory_snapshot(socket_fd, connection, send_fn, send_context) ||
+        !sync_player_crafting_slots(socket_fd, connection, send_fn, send_context))
+    {
+        ESP_LOGW(TAG, "inventory sync failed: user=%s", connection->username);
         connection->close_requested = true;
         return;
     }
@@ -2531,13 +2848,15 @@ static void handle_play_movement(proto_connection_t *connection,
                                  proto_reader_t *reader)
 {
     const proto_profile_t *profile = active_profile();
+    bool temp_on_ground = connection->on_ground;
+    double prev_y = connection->pos_y;
 
     if (packet_id == profile->c2s_play_position)
     {
         if (!read_f64_be(reader, &connection->pos_x) ||
             !read_f64_be(reader, &connection->pos_y) ||
             !read_f64_be(reader, &connection->pos_z) ||
-            !read_bool(reader, &connection->on_ground))
+            !read_bool(reader, &temp_on_ground))
         {
             connection->close_requested = true;
         }
@@ -2549,7 +2868,7 @@ static void handle_play_movement(proto_connection_t *connection,
             !read_f64_be(reader, &connection->pos_z) ||
             !read_f32_be(reader, &connection->yaw) ||
             !read_f32_be(reader, &connection->pitch) ||
-            !read_bool(reader, &connection->on_ground))
+            !read_bool(reader, &temp_on_ground))
         {
             connection->close_requested = true;
         }
@@ -2558,14 +2877,14 @@ static void handle_play_movement(proto_connection_t *connection,
     {
         if (!read_f32_be(reader, &connection->yaw) ||
             !read_f32_be(reader, &connection->pitch) ||
-            !read_bool(reader, &connection->on_ground))
+            !read_bool(reader, &temp_on_ground))
         {
             connection->close_requested = true;
         }
     }
     else if (packet_id == profile->c2s_play_on_ground)
     {
-        if (!read_bool(reader, &connection->on_ground))
+        if (!read_bool(reader, &temp_on_ground))
         {
             connection->close_requested = true;
         }
@@ -2576,6 +2895,8 @@ static void handle_play_movement(proto_connection_t *connection,
         return;
     }
 
+    connection->on_ground = temp_on_ground;
+
     if (!is_finite_coordinate(connection->pos_x) ||
         !is_finite_coordinate(connection->pos_y) ||
         !is_finite_coordinate(connection->pos_z))
@@ -2584,11 +2905,32 @@ static void handle_play_movement(proto_connection_t *connection,
         return;
     }
 
+    if (connection->pos_y < prev_y)
+    {
+        connection->fall_distance += (float)(prev_y - connection->pos_y);
+    }
+    
+    if (connection->on_ground)
+    {
+        if (connection->fall_distance > 3.0f)
+        {
+            connection->health -= (connection->fall_distance - 3.0f);
+            if (connection->health < 0.0f) connection->health = 0.0f;
+            connection->health_dirty = true;
+        }
+        connection->fall_distance = 0.0f;
+    }
+    else if (connection->pos_y > prev_y) 
+    {
+        connection->fall_distance = 0.0f;
+    }
+
     clamp_player_vertical_position(connection);
 }
 
 static void handle_play_arm_animation(proto_connection_t *connection,
-                                      proto_reader_t *reader)
+                                      proto_reader_t *reader,
+                                      uint64_t now_ms)
 {
     int32_t hand = 0;
     if (!proto_read_varint(reader, &hand))
@@ -2597,7 +2939,17 @@ static void handle_play_arm_animation(proto_connection_t *connection,
         return;
     }
 
-    (void)hand;
+    if (hand != 0)
+    {
+        return;
+    }
+
+    if (now_ms < connection->next_swing_allowed_ms)
+    {
+        return;
+    }
+
+    connection->next_swing_allowed_ms = now_ms + PROTO_SWING_COOLDOWN_MS;
     connection->pending_swing_animation = true;
 }
 
@@ -2686,6 +3038,31 @@ static bool adjust_position_for_face(int32_t *x, int32_t *y, int32_t *z, int32_t
     }
 }
 
+static bool send_ack_dig(int socket_fd,
+                       int32_t world_x,
+                       int32_t world_y,
+                       int32_t world_z,
+                       int32_t status,
+                       uint8_t block_id,
+                       bool successful,
+                       proto_send_callback_t send_fn,
+                       void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_ack_dig) ||
+        !write_block_position(&writer, world_x, world_y, world_z) ||
+        !proto_write_varint(&writer, world_block_to_state_id(block_id)) ||
+        !proto_write_varint(&writer, status) ||
+        !proto_write_u8(&writer, successful ? 1u : 0u))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
 static void handle_play_block_dig(proto_connection_t *connection,
                                   proto_reader_t *reader,
                                   int socket_fd,
@@ -2710,12 +3087,31 @@ static void handle_play_block_dig(proto_connection_t *connection,
 
     (void)face;
 
+    uint8_t current_block = query_block_id(world_x, world_y, world_z);
+
+    if (status == 0 || status == 1)
+    {
+        if (!send_ack_dig(socket_fd,
+                          world_x,
+                          world_y,
+                          world_z,
+                          status,
+                          current_block,
+                          true,
+                          send_fn,
+                          send_context))
+        {
+            connection->close_requested = true;
+        }
+        return;
+    }
+
     if (status != 2)
     {
         return;
     }
 
-    uint8_t broken_block = query_block_id(world_x, world_y, world_z);
+    uint8_t broken_block = current_block;
 
     bool changed = false;
     if (!set_block_override(world_x, world_y, world_z, BLOCK_AIR, &changed))
@@ -2725,11 +3121,36 @@ static void handle_play_block_dig(proto_connection_t *connection,
                  (long)world_x,
                  (long)world_y,
                  (long)world_z);
+
+        if (!send_ack_dig(socket_fd,
+                          world_x,
+                          world_y,
+                          world_z,
+                          status,
+                          broken_block,
+                          false,
+                          send_fn,
+                          send_context))
+        {
+            connection->close_requested = true;
+        }
         return;
     }
 
     if (!changed)
     {
+        if (!send_ack_dig(socket_fd,
+                          world_x,
+                          world_y,
+                          world_z,
+                          status,
+                          broken_block,
+                          false,
+                          send_fn,
+                          send_context))
+        {
+            connection->close_requested = true;
+        }
         return;
     }
 
@@ -2741,6 +3162,20 @@ static void handle_play_block_dig(proto_connection_t *connection,
                          send_fn,
                          broadcast_fn,
                          send_context);
+
+    if (!send_ack_dig(socket_fd,
+                      world_x,
+                      world_y,
+                      world_z,
+                      status,
+                      BLOCK_AIR,
+                      true,
+                      send_fn,
+                      send_context))
+    {
+        connection->close_requested = true;
+        return;
+    }
 
     uint16_t drop_item_id = world_block_to_item_id(broken_block);
     if (drop_item_id != 0)
@@ -2773,25 +3208,283 @@ static void handle_play_held_item_change(proto_connection_t *connection,
     if (slot <= 8)
     {
         connection->selected_hotbar_slot = (uint8_t)slot;
+        connection->inventory_dirty = true;
+        if (!persist_player_inventory_to_nvs(connection))
+        {
+            ESP_LOGW(TAG,
+                     "inventory persist deferred after hotbar change: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
+        }
+    }
+}
+
+static void handle_inventory_left_click(proto_connection_t *connection,
+                                        int16_t slot)
+{
+    uint16_t slot_item_id = connection->inventory_item_ids[slot];
+    uint8_t slot_count = connection->inventory_item_counts[slot];
+    uint16_t cursor_item_id = connection->cursor_item_id;
+    uint8_t cursor_count = connection->cursor_item_count;
+
+    if (cursor_count == 0)
+    {
+        connection->cursor_item_id = slot_item_id;
+        connection->cursor_item_count = slot_count;
+        connection->inventory_item_ids[slot] = 0;
+        connection->inventory_item_counts[slot] = 0;
+        return;
+    }
+
+    if (slot_count == 0)
+    {
+        connection->inventory_item_ids[slot] = cursor_item_id;
+        connection->inventory_item_counts[slot] = cursor_count;
+        connection->cursor_item_id = 0;
+        connection->cursor_item_count = 0;
+        return;
+    }
+
+    if (slot_item_id == cursor_item_id && slot_count < PROTO_ITEM_STACK_DEFAULT)
+    {
+        uint8_t room = (uint8_t)(PROTO_ITEM_STACK_DEFAULT - slot_count);
+        uint8_t moved = (cursor_count < room) ? cursor_count : room;
+        connection->inventory_item_counts[slot] = (uint8_t)(slot_count + moved);
+        connection->cursor_item_count = (uint8_t)(cursor_count - moved);
+        if (connection->cursor_item_count == 0)
+        {
+            connection->cursor_item_id = 0;
+        }
+        return;
+    }
+
+    connection->inventory_item_ids[slot] = cursor_item_id;
+    connection->inventory_item_counts[slot] = cursor_count;
+    connection->cursor_item_id = slot_item_id;
+    connection->cursor_item_count = slot_count;
+}
+
+static bool skip_click_window_clicked_item(proto_reader_t *reader)
+{
+    uint8_t present = 0;
+    if (!proto_read_u8(reader, &present))
+    {
+        return false;
+    }
+
+    if (present == 0)
+    {
+        return true;
+    }
+
+    int32_t item_id = 0;
+    uint8_t count = 0;
+    uint8_t nbt_tag = 0;
+    if (!proto_read_varint(reader, &item_id) ||
+        !proto_read_u8(reader, &count) ||
+        !proto_read_u8(reader, &nbt_tag))
+    {
+        return false;
+    }
+
+    (void)item_id;
+    (void)count;
+
+    return nbt_tag == 0;
+}
+
+static void handle_play_click_window(proto_connection_t *connection,
+                                     proto_reader_t *reader,
+                                     int socket_fd,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
+{
+    uint8_t window_id = 0;
+    uint16_t slot_raw = 0;
+    uint8_t button = 0;
+    uint16_t action_number = 0;
+    int32_t mode = 0;
+
+    if (!proto_read_u8(reader, &window_id) ||
+        !proto_read_u16_be(reader, &slot_raw) ||
+        !proto_read_u8(reader, &button) ||
+        !proto_read_u16_be(reader, &action_number) ||
+        !proto_read_varint(reader, &mode) ||
+        !skip_click_window_clicked_item(reader))
+    {
+        connection->close_requested = true;
+        return;
+    }
+
+    (void)action_number;
+
+    if (window_id != 0 || mode != 0)
+    {
+        return;
+    }
+
+    if (button != 0 && button != 1)
+    {
+        return;
+    }
+
+    int16_t slot = (int16_t)slot_raw;
+
+    if (button == 1)
+    {
+        if (slot == -999)
+        {
+            if (connection->cursor_item_count > 0)
+            {
+                connection->cursor_item_count--;
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+                if (!send_cursor_update(socket_fd, connection, send_fn, send_context))
+                {
+                    connection->close_requested = true;
+                }
+                connection->inventory_dirty = true;
+                if (persist_player_inventory_to_nvs(connection))
+                {
+                    connection->inventory_dirty = false;
+                }
+            }
+            return;
+        }
+
+        if (connection->inventory_item_ids[slot] != 0 && connection->inventory_item_counts[slot] > 0)
+        {
+            uint8_t half = (connection->inventory_item_counts[slot] + 1) / 2;
+            connection->cursor_item_id = connection->inventory_item_ids[slot];
+            connection->cursor_item_count = half;
+            connection->inventory_item_counts[slot] = (uint8_t)(connection->inventory_item_counts[slot] - half);
+            if (connection->inventory_item_counts[slot] == 0)
+            {
+                connection->inventory_item_ids[slot] = 0;
+            }
+            if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context) ||
+                !send_cursor_update(socket_fd, connection, send_fn, send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+            connection->inventory_dirty = true;
+            if (persist_player_inventory_to_nvs(connection))
+            {
+                connection->inventory_dirty = false;
+            }
+        }
+        return;
+    }
+
+    if (slot == -999)
+    {
+        if (connection->cursor_item_count > 0)
+        {
+            connection->cursor_item_id = 0;
+            connection->cursor_item_count = 0;
+            if (!send_cursor_update(socket_fd, connection, send_fn, send_context))
+            {
+                connection->close_requested = true;
+            }
+            connection->inventory_dirty = true;
+            if (persist_player_inventory_to_nvs(connection))
+            {
+                connection->inventory_dirty = false;
+            }
+        }
+        return;
+    }
+
+    if (slot < 0 || slot > 45)
+    {
+        return;
+    }
+
+    if (slot == 0)
+    {
+        proto_crafting_result_t output = evaluate_player_crafting_result(connection);
+        if (output.count == 0)
+        {
+            return;
+        }
+
+        if (connection->cursor_item_count > 0 &&
+            (connection->cursor_item_id != output.item_id ||
+             connection->cursor_item_count > (PROTO_ITEM_STACK_DEFAULT - output.count)))
+        {
+            return;
+        }
+
+        if (connection->cursor_item_count == 0)
+        {
+            connection->cursor_item_id = output.item_id;
+            connection->cursor_item_count = output.count;
+        }
+        else
+        {
+            connection->cursor_item_count = (uint8_t)(connection->cursor_item_count + output.count);
+        }
+
+        consume_player_crafting_ingredients(connection);
+        if (!send_cursor_update(socket_fd, connection, send_fn, send_context) ||
+            !sync_player_crafting_slots(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+        connection->inventory_dirty = true;
+    }
+    else
+    {
+        handle_inventory_left_click(connection, slot);
+        if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context) ||
+            !send_cursor_update(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+
+        if (slot >= 1 && slot <= 4)
+        {
+            if (!sync_player_crafting_slots(socket_fd, connection, send_fn, send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+        }
+
+        connection->inventory_dirty = true;
+    }
+
+    if (connection->inventory_dirty)
+    {
+        if (persist_player_inventory_to_nvs(connection))
+        {
+            connection->inventory_dirty = false;
+        }
     }
 }
 
 static uint8_t item_id_to_block_id(uint16_t item_id)
 {
-    // Mapping 1.16.5 item IDs to local block IDs.
-    // Extremely simplified mapping.
     switch (item_id)
     {
-    case 1:  return BLOCK_STONE;
-    case 9:  return BLOCK_GRASS;
-    case 10: return BLOCK_DIRT;
-    case 21: return BLOCK_COBBLESTONE;
-    case 24: return BLOCK_SAND;
-    case 35: return BLOCK_OAK_LOG;
-    case 140:return BLOCK_OAK_LEAVES;
-    case 56: return BLOCK_DIAMOND_ORE;
-    case 80: return BLOCK_SNOW_BLOCK;
-    default: return BLOCK_COBBLESTONE;
+    case PROTO_ITEM_DIRT:
+        return BLOCK_DIRT;
+    case PROTO_ITEM_COBBLESTONE:
+        return BLOCK_COBBLESTONE;
+    case PROTO_ITEM_SAND:
+        return BLOCK_SAND;
+    case PROTO_ITEM_OAK_LOG:
+        return BLOCK_OAK_LOG;
+    case PROTO_ITEM_OAK_LEAVES:
+        return BLOCK_OAK_LEAVES;
+    case PROTO_ITEM_DIAMOND:
+        return BLOCK_DIAMOND_ORE;
+    default:
+        return BLOCK_AIR;
     }
 }
 
@@ -2843,6 +3536,11 @@ static void handle_play_block_place(proto_connection_t *connection,
     uint16_t current_item_id = connection->inventory_item_ids[36 + connection->selected_hotbar_slot];
     uint8_t block_id = item_id_to_block_id(current_item_id);
 
+    if (block_id == BLOCK_AIR)
+    {
+        return;
+    }
+
     if (!set_block_override(place_x,
                             place_y,
                             place_z,
@@ -2870,6 +3568,32 @@ static void handle_play_block_place(proto_connection_t *connection,
                          send_fn,
                          broadcast_fn,
                          send_context);
+
+    uint8_t selected_slot = (uint8_t)(36 + connection->selected_hotbar_slot);
+    if (connection->inventory_item_counts[selected_slot] > 0)
+    {
+        connection->inventory_item_counts[selected_slot]--;
+        if (connection->inventory_item_counts[selected_slot] == 0)
+        {
+            connection->inventory_item_ids[selected_slot] = 0;
+        }
+
+        if (!send_inventory_slot_update(socket_fd,
+                                        (int16_t)selected_slot,
+                                        connection,
+                                        send_fn,
+                                        send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+
+        connection->inventory_dirty = true;
+        if (persist_player_inventory_to_nvs(connection))
+        {
+            connection->inventory_dirty = false;
+        }
+    }
 }
 
 static void handle_play(proto_connection_t *connection,
@@ -2899,7 +3623,7 @@ static void handle_play(proto_connection_t *connection,
     }
     else if (packet_id == profile->c2s_play_arm_animation)
     {
-        handle_play_arm_animation(connection, reader);
+        handle_play_arm_animation(connection, reader, now_ms);
     }
     else if (packet_id == profile->c2s_play_position ||
              packet_id == profile->c2s_play_position_look ||
@@ -2929,6 +3653,14 @@ static void handle_play(proto_connection_t *connection,
     else if (packet_id == profile->c2s_play_held_item_change)
     {
         handle_play_held_item_change(connection, reader);
+    }
+    else if (packet_id == profile->c2s_play_click_window)
+    {
+        handle_play_click_window(connection,
+                                 reader,
+                                 socket_fd,
+                                 send_fn,
+                                 send_context);
     }
 }
 
@@ -2981,7 +3713,8 @@ static void tick_survival_state(proto_connection_t *connection,
                                 void *send_context,
                                 uint64_t now_ms)
 {
-    bool health_changed = false;
+    bool health_changed = connection->health_dirty;
+    connection->health_dirty = false;
 
     ensure_world_initialized();
 
@@ -3175,7 +3908,6 @@ void proto_tick_connection(proto_connection_t *connection,
 
     int32_t current_chunk_x = chunk_coord_from_position(connection->pos_x);
     int32_t current_chunk_z = chunk_coord_from_position(connection->pos_z);
-    bool chunk_center_changed = false;
 
     if (!connection->chunk_stream_initialized ||
         current_chunk_x != connection->chunk_center_x ||
@@ -3193,7 +3925,6 @@ void proto_tick_connection(proto_connection_t *connection,
         connection->chunk_center_x = current_chunk_x;
         connection->chunk_center_z = current_chunk_z;
         connection->chunk_scan_index = 0;
-        chunk_center_changed = true;
 
         if (!send_update_view_position_packet(socket_fd,
                                               current_chunk_x,
@@ -3220,6 +3951,11 @@ void proto_tick_connection(proto_connection_t *connection,
                      connection->username[0] != '\0' ? connection->username : "(unknown)");
             break;
         }
+
+        if (send_index < (chunk_send_budget - 1))
+        {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
     }
 
     if (is_chunk_tracked(connection, connection->chunk_center_x, connection->chunk_center_z))
@@ -3228,6 +3964,11 @@ void proto_tick_connection(proto_connection_t *connection,
     }
 
     tick_survival_state(connection, socket_fd, send_fn, send_context, now_ms);
+
+    if (connection->inventory_dirty && persist_player_inventory_to_nvs(connection))
+    {
+        connection->inventory_dirty = false;
+    }
 }
 
 bool proto_send_player_presence(int socket_fd,

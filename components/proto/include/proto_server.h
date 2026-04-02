@@ -23,9 +23,16 @@ typedef enum
 typedef struct
 {
     proto_state_t state;
-    bool close_requested;
-    bool joined_play;
-    bool awaiting_keepalive;
+    bool close_requested : 1;
+    bool joined_play : 1;
+    bool awaiting_keepalive : 1;
+    bool pending_swing_animation : 1;
+    bool pending_attack_event : 1;
+    bool on_ground : 1;
+    bool chunk_stream_initialized : 1;
+    bool has_previous_chunk_center : 1;
+    bool inventory_dirty : 1;
+    
     int32_t entity_id;
     int64_t uuid_most;
     int64_t uuid_least;
@@ -39,31 +46,33 @@ typedef struct
     double prev_pos_x;
     double prev_pos_y;
     double prev_pos_z;
-    bool pending_swing_animation;
-    bool pending_attack_event;
     int32_t pending_attack_target_entity_id;
     uint64_t next_attack_allowed_ms;
+    uint64_t next_swing_allowed_ms;
     float yaw;
     float pitch;
     float health;
+    bool health_dirty;
     int32_t food_level;
     float food_saturation;
     uint64_t next_hunger_decay_ms;
     uint64_t next_health_regen_ms;
     uint64_t next_starvation_damage_ms;
     uint64_t next_void_damage_ms;
-    bool on_ground;
-    bool chunk_stream_initialized;
     int32_t chunk_center_x;
     int32_t chunk_center_z;
-    bool has_previous_chunk_center;
     int32_t previous_chunk_center_x;
     int32_t previous_chunk_center_z;
+    float fall_distance;
     uint64_t chunk_unload_grace_until_ms;
     uint16_t chunk_scan_index;
     uint16_t chunk_sent_count;
-    proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];    uint8_t selected_hotbar_slot;    uint16_t inventory_item_ids[46];
+    proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];
+    uint8_t selected_hotbar_slot;
+    uint16_t inventory_item_ids[46];
     uint8_t inventory_item_counts[46];
+    uint16_t cursor_item_id;
+    uint8_t cursor_item_count;
     char username[17];
 } proto_connection_t;
 

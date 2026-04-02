@@ -316,8 +316,12 @@ static void process_pending_interaction_events(net_server_state_t *server,
 
     if (client->protocol.pending_swing_animation)
     {
-        broadcast_entity_animation(server, client->protocol.entity_id, 0);
-        client->protocol.pending_swing_animation = false;
+        if (now_ms >= client->protocol.next_swing_allowed_ms)
+        {
+            broadcast_entity_animation(server, client->protocol.entity_id, 0);
+            client->protocol.pending_swing_animation = false;
+            client->protocol.next_swing_allowed_ms = now_ms + 125ULL;
+        }
     }
 
     if (!client->protocol.pending_attack_event)
@@ -365,6 +369,7 @@ static void process_pending_interaction_events(net_server_state_t *server,
                  "health update delivery failed: target_fd=%d target_entity=%ld",
                  target->socket_fd,
                  (long)target->protocol.entity_id);
+        target->protocol.close_requested = true;
     }
 }
 
@@ -486,15 +491,21 @@ static void process_stream_packets(net_server_state_t *server,
                     continue;
                 }
 
-                proto_send_player_presence(client->socket_fd,
-                                           &peer->protocol,
-                                           socket_send_all,
-                                           server);
+                if (!proto_send_player_presence(client->socket_fd,
+                                                &peer->protocol,
+                                                socket_send_all,
+                                                server))
+                {
+                    client->protocol.close_requested = true;
+                }
 
-                proto_send_player_presence(peer->socket_fd,
-                                           &client->protocol,
-                                           socket_send_all,
-                                           server);
+                if (!proto_send_player_presence(peer->socket_fd,
+                                                &client->protocol,
+                                                socket_send_all,
+                                                server))
+                {
+                    peer->protocol.close_requested = true;
+                }
             }
 
             client->protocol.prev_pos_x = client->protocol.pos_x;
@@ -685,10 +696,13 @@ static void server_task(void *arg)
                         continue;
                     }
 
-                    proto_send_entity_pos_rot(observer->socket_fd,
-                                              &mover->protocol,
-                                              socket_send_all,
-                                              server);
+                    if (!proto_send_entity_pos_rot(observer->socket_fd,
+                                                   &mover->protocol,
+                                                   socket_send_all,
+                                                   server))
+                    {
+                        observer->protocol.close_requested = true;
+                    }
                 }
             }
 
