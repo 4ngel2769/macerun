@@ -1,5 +1,6 @@
 #include "proto_server.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <limits.h>
 #include <stddef.h>
@@ -67,15 +68,69 @@ typedef enum
 #define PROTO_INVENTORY_SLOT_HOTBAR_FIRST 36
 #define PROTO_INVENTORY_SLOT_HOTBAR_LAST 44
 #define PROTO_ITEM_STACK_DEFAULT 64
-#define PROTO_ITEM_OAK_PLANKS 16
-#define PROTO_ITEM_STICK 32
+#define PROTO_ITEM_OAK_PLANKS 15
+#define PROTO_ITEM_SPRUCE_PLANKS 16
+#define PROTO_ITEM_BIRCH_PLANKS 17
+#define PROTO_ITEM_JUNGLE_PLANKS 18
+#define PROTO_ITEM_ACACIA_PLANKS 19
+#define PROTO_ITEM_DARK_OAK_PLANKS 20
+#define PROTO_ITEM_CRIMSON_PLANKS 21
+#define PROTO_ITEM_WARPED_PLANKS 22
+#define PROTO_ITEM_STICK 613
 #define PROTO_ITEM_DIRT 9
 #define PROTO_ITEM_COBBLESTONE 14
 #define PROTO_ITEM_SAND 30
 #define PROTO_ITEM_OAK_LOG 37
+#define PROTO_ITEM_OAK_WOOD 61
+#define PROTO_ITEM_STRIPPED_OAK_LOG 45
+#define PROTO_ITEM_STRIPPED_OAK_WOOD 53
+#define PROTO_ITEM_SPRUCE_LOG 38
+#define PROTO_ITEM_SPRUCE_WOOD 62
+#define PROTO_ITEM_STRIPPED_SPRUCE_LOG 46
+#define PROTO_ITEM_STRIPPED_SPRUCE_WOOD 54
+#define PROTO_ITEM_BAMBOO 135
 #define PROTO_ITEM_OAK_LEAVES 69
+#define PROTO_ITEM_CRAFTING_TABLE 183
+#define PROTO_ITEM_FURNACE 185
 #define PROTO_ITEM_DIAMOND 578
 #define PROTO_ITEM_SNOWBALL 666
+
+typedef struct
+{
+    const char *name;
+    uint16_t item_id;
+} proto_item_name_entry_t;
+
+static const proto_item_name_entry_t s_item_name_entries[] = {
+    {"oak_planks", PROTO_ITEM_OAK_PLANKS},
+    {"spruce_planks", PROTO_ITEM_SPRUCE_PLANKS},
+    {"birch_planks", PROTO_ITEM_BIRCH_PLANKS},
+    {"jungle_planks", PROTO_ITEM_JUNGLE_PLANKS},
+    {"acacia_planks", PROTO_ITEM_ACACIA_PLANKS},
+    {"dark_oak_planks", PROTO_ITEM_DARK_OAK_PLANKS},
+    {"crimson_planks", PROTO_ITEM_CRIMSON_PLANKS},
+    {"warped_planks", PROTO_ITEM_WARPED_PLANKS},
+    {"stick", PROTO_ITEM_STICK},
+    {"dirt", PROTO_ITEM_DIRT},
+    {"cobblestone", PROTO_ITEM_COBBLESTONE},
+    {"sand", PROTO_ITEM_SAND},
+    {"oak_log", PROTO_ITEM_OAK_LOG},
+    {"oak_wood", PROTO_ITEM_OAK_WOOD},
+    {"stripped_oak_log", PROTO_ITEM_STRIPPED_OAK_LOG},
+    {"stripped_oak_wood", PROTO_ITEM_STRIPPED_OAK_WOOD},
+    {"spruce_log", PROTO_ITEM_SPRUCE_LOG},
+    {"spruce_wood", PROTO_ITEM_SPRUCE_WOOD},
+    {"stripped_spruce_log", PROTO_ITEM_STRIPPED_SPRUCE_LOG},
+    {"stripped_spruce_wood", PROTO_ITEM_STRIPPED_SPRUCE_WOOD},
+    {"bamboo", PROTO_ITEM_BAMBOO},
+    {"oak_leaves", PROTO_ITEM_OAK_LEAVES},
+    {"crafting_table", PROTO_ITEM_CRAFTING_TABLE},
+    {"furnace", PROTO_ITEM_FURNACE},
+    {"diamond", PROTO_ITEM_DIAMOND},
+    {"snowball", PROTO_ITEM_SNOWBALL},
+};
+
+#define PROTO_ITEM_NAME_ENTRY_COUNT ((size_t)(sizeof(s_item_name_entries) / sizeof(s_item_name_entries[0])))
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
@@ -103,6 +158,10 @@ static const int32_t s_chunk_palette_state_ids[] = {
     158,
     3354,
     3930,
+    15,
+    16,
+    3356,
+    3374,
 };
 
 #define PROTO_CHUNK_PALETTE_SIZE ((int32_t)(sizeof(s_chunk_palette_state_ids) / sizeof(s_chunk_palette_state_ids[0])))
@@ -498,6 +557,14 @@ static int32_t world_block_to_state_id(uint8_t block_id)
         return 3354;
     case BLOCK_SNOW_BLOCK:
         return 3930;
+    case BLOCK_OAK_PLANKS:
+        return 15;
+    case BLOCK_SPRUCE_PLANKS:
+        return 16;
+    case BLOCK_CRAFTING_TABLE:
+        return 3356;
+    case BLOCK_FURNACE:
+        return 3374;
     default:
         return 1;
     }
@@ -531,6 +598,14 @@ static uint8_t world_block_to_palette_index(uint8_t block_id)
         return 10;
     case BLOCK_SNOW_BLOCK:
         return 11;
+    case BLOCK_OAK_PLANKS:
+        return 12;
+    case BLOCK_SPRUCE_PLANKS:
+        return 13;
+    case BLOCK_CRAFTING_TABLE:
+        return 14;
+    case BLOCK_FURNACE:
+        return 15;
     default:
         return 1;
     }
@@ -558,6 +633,14 @@ static uint16_t world_block_to_item_id(uint8_t block_id)
         return PROTO_ITEM_DIAMOND;
     case BLOCK_SNOW_BLOCK:
         return PROTO_ITEM_SNOWBALL;
+    case BLOCK_OAK_PLANKS:
+        return PROTO_ITEM_OAK_PLANKS;
+    case BLOCK_SPRUCE_PLANKS:
+        return PROTO_ITEM_SPRUCE_PLANKS;
+    case BLOCK_CRAFTING_TABLE:
+        return PROTO_ITEM_CRAFTING_TABLE;
+    case BLOCK_FURNACE:
+        return PROTO_ITEM_FURNACE;
     default:
         return 0;
     }
@@ -960,84 +1043,314 @@ typedef struct
     uint8_t count;
 } proto_crafting_result_t;
 
-static proto_crafting_result_t evaluate_player_crafting_result(const proto_connection_t *connection)
+typedef struct
 {
-    proto_crafting_result_t result = {0};
+    uint8_t ingredient_count;
+    uint16_t ingredients[4];
+    proto_crafting_result_t output;
+} proto_player_shapeless_recipe_t;
 
-    uint8_t occupied_count = 0;
-    int8_t single_slot_index = -1;
-    uint8_t plank_slot_count = 0;
-    for (uint8_t slot = 1; slot <= 4; slot++)
+typedef struct
+{
+    uint8_t width;
+    uint8_t height;
+    uint16_t pattern[4];
+    proto_crafting_result_t output;
+} proto_player_shaped_recipe_t;
+
+typedef struct
+{
+    proto_crafting_result_t output;
+    uint8_t consume_mask;
+} proto_player_crafting_match_t;
+
+static const proto_player_shapeless_recipe_t s_player_shapeless_recipes[] = {
+    {1, {PROTO_ITEM_OAK_LOG, 0, 0, 0}, {PROTO_ITEM_OAK_PLANKS, 4}},
+    {1, {PROTO_ITEM_OAK_WOOD, 0, 0, 0}, {PROTO_ITEM_OAK_PLANKS, 4}},
+    {1, {PROTO_ITEM_STRIPPED_OAK_LOG, 0, 0, 0}, {PROTO_ITEM_OAK_PLANKS, 4}},
+    {1, {PROTO_ITEM_STRIPPED_OAK_WOOD, 0, 0, 0}, {PROTO_ITEM_OAK_PLANKS, 4}},
+    {1, {PROTO_ITEM_SPRUCE_LOG, 0, 0, 0}, {PROTO_ITEM_SPRUCE_PLANKS, 4}},
+    {1, {PROTO_ITEM_SPRUCE_WOOD, 0, 0, 0}, {PROTO_ITEM_SPRUCE_PLANKS, 4}},
+    {1, {PROTO_ITEM_STRIPPED_SPRUCE_LOG, 0, 0, 0}, {PROTO_ITEM_SPRUCE_PLANKS, 4}},
+    {1, {PROTO_ITEM_STRIPPED_SPRUCE_WOOD, 0, 0, 0}, {PROTO_ITEM_SPRUCE_PLANKS, 4}},
+};
+
+static const proto_player_shaped_recipe_t s_player_shaped_recipes[] = {
+    {1, 2, {PROTO_ITEM_OAK_PLANKS, PROTO_ITEM_OAK_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_SPRUCE_PLANKS, PROTO_ITEM_SPRUCE_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_BIRCH_PLANKS, PROTO_ITEM_BIRCH_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_JUNGLE_PLANKS, PROTO_ITEM_JUNGLE_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_ACACIA_PLANKS, PROTO_ITEM_ACACIA_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_DARK_OAK_PLANKS, PROTO_ITEM_DARK_OAK_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_CRIMSON_PLANKS, PROTO_ITEM_CRIMSON_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_WARPED_PLANKS, PROTO_ITEM_WARPED_PLANKS, 0, 0}, {PROTO_ITEM_STICK, 4}},
+    {1, 2, {PROTO_ITEM_BAMBOO, PROTO_ITEM_BAMBOO, 0, 0}, {PROTO_ITEM_STICK, 4}},
+
+    {2, 2, {PROTO_ITEM_OAK_PLANKS, PROTO_ITEM_OAK_PLANKS, PROTO_ITEM_OAK_PLANKS, PROTO_ITEM_OAK_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_SPRUCE_PLANKS, PROTO_ITEM_SPRUCE_PLANKS, PROTO_ITEM_SPRUCE_PLANKS, PROTO_ITEM_SPRUCE_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_BIRCH_PLANKS, PROTO_ITEM_BIRCH_PLANKS, PROTO_ITEM_BIRCH_PLANKS, PROTO_ITEM_BIRCH_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_JUNGLE_PLANKS, PROTO_ITEM_JUNGLE_PLANKS, PROTO_ITEM_JUNGLE_PLANKS, PROTO_ITEM_JUNGLE_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_ACACIA_PLANKS, PROTO_ITEM_ACACIA_PLANKS, PROTO_ITEM_ACACIA_PLANKS, PROTO_ITEM_ACACIA_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_DARK_OAK_PLANKS, PROTO_ITEM_DARK_OAK_PLANKS, PROTO_ITEM_DARK_OAK_PLANKS, PROTO_ITEM_DARK_OAK_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_CRIMSON_PLANKS, PROTO_ITEM_CRIMSON_PLANKS, PROTO_ITEM_CRIMSON_PLANKS, PROTO_ITEM_CRIMSON_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+    {2, 2, {PROTO_ITEM_WARPED_PLANKS, PROTO_ITEM_WARPED_PLANKS, PROTO_ITEM_WARPED_PLANKS, PROTO_ITEM_WARPED_PLANKS}, {PROTO_ITEM_CRAFTING_TABLE, 1}},
+};
+
+#define PLAYER_SHAPELESS_RECIPE_COUNT ((size_t)(sizeof(s_player_shapeless_recipes) / sizeof(s_player_shapeless_recipes[0])))
+#define PLAYER_SHAPED_RECIPE_COUNT ((size_t)(sizeof(s_player_shaped_recipes) / sizeof(s_player_shaped_recipes[0])))
+
+static uint16_t player_crafting_grid_item(const proto_connection_t *connection, uint8_t grid_index)
+{
+    if (grid_index > 3)
     {
-        if (connection->inventory_item_counts[slot] > 0)
+        return 0;
+    }
+
+    uint8_t slot = (uint8_t)(grid_index + 1);
+    if (connection->inventory_item_counts[slot] == 0)
+    {
+        return 0;
+    }
+
+    return connection->inventory_item_ids[slot];
+}
+
+static bool is_plank_item(uint16_t item_id)
+{
+    switch (item_id)
+    {
+    case PROTO_ITEM_OAK_PLANKS:
+    case PROTO_ITEM_SPRUCE_PLANKS:
+    case PROTO_ITEM_BIRCH_PLANKS:
+    case PROTO_ITEM_JUNGLE_PLANKS:
+    case PROTO_ITEM_ACACIA_PLANKS:
+    case PROTO_ITEM_DARK_OAK_PLANKS:
+    case PROTO_ITEM_CRIMSON_PLANKS:
+    case PROTO_ITEM_WARPED_PLANKS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool match_player_shaped_recipe(const proto_connection_t *connection,
+                                       const proto_player_shaped_recipe_t *recipe,
+                                       uint8_t *consume_mask_out)
+{
+    if (recipe->width == 0 || recipe->height == 0 || recipe->width > 2 || recipe->height > 2)
+    {
+        return false;
+    }
+
+    for (uint8_t offset_y = 0; offset_y <= (uint8_t)(2 - recipe->height); offset_y++)
+    {
+        for (uint8_t offset_x = 0; offset_x <= (uint8_t)(2 - recipe->width); offset_x++)
         {
-            occupied_count++;
-            single_slot_index = (int8_t)slot;
-            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_PLANKS)
+            bool matches = true;
+            uint8_t consume_mask = 0;
+
+            for (uint8_t y = 0; y < 2 && matches; y++)
             {
-                plank_slot_count++;
+                for (uint8_t x = 0; x < 2; x++)
+                {
+                    uint8_t grid_index = (uint8_t)(y * 2 + x);
+                    uint16_t actual_item = player_crafting_grid_item(connection, grid_index);
+
+                    uint16_t expected_item = 0;
+                    if (x >= offset_x && x < offset_x + recipe->width &&
+                        y >= offset_y && y < offset_y + recipe->height)
+                    {
+                        uint8_t recipe_x = (uint8_t)(x - offset_x);
+                        uint8_t recipe_y = (uint8_t)(y - offset_y);
+                        uint8_t recipe_index = (uint8_t)(recipe_y * recipe->width + recipe_x);
+                        expected_item = recipe->pattern[recipe_index];
+                    }
+
+                    if (actual_item != expected_item)
+                    {
+                        matches = false;
+                        break;
+                    }
+
+                    if (expected_item != 0)
+                    {
+                        consume_mask |= (uint8_t)(1u << grid_index);
+                    }
+                }
+            }
+
+            if (matches)
+            {
+                *consume_mask_out = consume_mask;
+                return true;
             }
         }
     }
 
-    if (occupied_count == 1 && single_slot_index >= 0)
+    return false;
+}
+
+static bool match_player_shapeless_recipe(const proto_connection_t *connection,
+                                          const proto_player_shapeless_recipe_t *recipe,
+                                          uint8_t *consume_mask_out)
+{
+    if (recipe->ingredient_count == 0 || recipe->ingredient_count > 4)
     {
-        uint16_t ingredient = connection->inventory_item_ids[(uint8_t)single_slot_index];
-        if (ingredient == PROTO_ITEM_OAK_LOG)
-        {
-            result.item_id = PROTO_ITEM_OAK_PLANKS;
-            result.count = 4;
-        }
-    }
-    else if (occupied_count == 2 && plank_slot_count == 2)
-    {
-        result.item_id = PROTO_ITEM_STICK;
-        result.count = 4;
+        return false;
     }
 
-    return result;
+    uint16_t actual_items[4] = {0};
+    uint8_t actual_grid_indices[4] = {0};
+    uint8_t actual_count = 0;
+
+    for (uint8_t grid_index = 0; grid_index < 4; grid_index++)
+    {
+        uint16_t item_id = player_crafting_grid_item(connection, grid_index);
+        if (item_id == 0)
+        {
+            continue;
+        }
+
+        actual_items[actual_count] = item_id;
+        actual_grid_indices[actual_count] = grid_index;
+        actual_count++;
+    }
+
+    if (actual_count != recipe->ingredient_count)
+    {
+        return false;
+    }
+
+    bool used_actual[4] = {false, false, false, false};
+    uint8_t consume_mask = 0;
+
+    for (uint8_t ingredient_index = 0; ingredient_index < recipe->ingredient_count; ingredient_index++)
+    {
+        uint16_t needed_item = recipe->ingredients[ingredient_index];
+        bool found = false;
+
+        for (uint8_t actual_index = 0; actual_index < actual_count; actual_index++)
+        {
+            if (used_actual[actual_index])
+            {
+                continue;
+            }
+
+            if (actual_items[actual_index] != needed_item)
+            {
+                continue;
+            }
+
+            used_actual[actual_index] = true;
+            consume_mask |= (uint8_t)(1u << actual_grid_indices[actual_index]);
+            found = true;
+            break;
+        }
+
+        if (!found)
+        {
+            return false;
+        }
+    }
+
+    *consume_mask_out = consume_mask;
+    return true;
+}
+
+static proto_player_crafting_match_t evaluate_player_crafting_match(const proto_connection_t *connection)
+{
+    proto_player_crafting_match_t match = {0};
+
+    uint16_t top_left = player_crafting_grid_item(connection, 0);
+    uint16_t top_right = player_crafting_grid_item(connection, 1);
+    uint16_t bottom_left = player_crafting_grid_item(connection, 2);
+    uint16_t bottom_right = player_crafting_grid_item(connection, 3);
+
+    if (top_left != 0 && top_right != 0 && bottom_left != 0 && bottom_right != 0 &&
+        is_plank_item(top_left) && is_plank_item(top_right) &&
+        is_plank_item(bottom_left) && is_plank_item(bottom_right))
+    {
+        match.output.item_id = PROTO_ITEM_CRAFTING_TABLE;
+        match.output.count = 1;
+        match.consume_mask = 0x0F;
+        return match;
+    }
+
+    bool left_column_only = top_left != 0 && bottom_left != 0 && top_right == 0 && bottom_right == 0;
+    bool right_column_only = top_right != 0 && bottom_right != 0 && top_left == 0 && bottom_left == 0;
+
+    if (left_column_only || right_column_only)
+    {
+        uint16_t top = left_column_only ? top_left : top_right;
+        uint16_t bottom = left_column_only ? bottom_left : bottom_right;
+
+        bool plank_stick = is_plank_item(top) && is_plank_item(bottom);
+        bool bamboo_stick = top == PROTO_ITEM_BAMBOO && bottom == PROTO_ITEM_BAMBOO;
+
+        if (plank_stick || bamboo_stick)
+        {
+            match.output.item_id = PROTO_ITEM_STICK;
+            match.output.count = 4;
+            match.consume_mask = left_column_only ? 0x05 : 0x0A;
+            return match;
+        }
+    }
+
+    for (size_t recipe_index = 0; recipe_index < PLAYER_SHAPED_RECIPE_COUNT; recipe_index++)
+    {
+        uint8_t consume_mask = 0;
+        if (match_player_shaped_recipe(connection, &s_player_shaped_recipes[recipe_index], &consume_mask))
+        {
+            match.output = s_player_shaped_recipes[recipe_index].output;
+            match.consume_mask = consume_mask;
+            return match;
+        }
+    }
+
+    for (size_t recipe_index = 0; recipe_index < PLAYER_SHAPELESS_RECIPE_COUNT; recipe_index++)
+    {
+        uint8_t consume_mask = 0;
+        if (match_player_shapeless_recipe(connection, &s_player_shapeless_recipes[recipe_index], &consume_mask))
+        {
+            match.output = s_player_shapeless_recipes[recipe_index].output;
+            match.consume_mask = consume_mask;
+            return match;
+        }
+    }
+
+    return match;
+}
+
+static proto_crafting_result_t evaluate_player_crafting_result(const proto_connection_t *connection)
+{
+    return evaluate_player_crafting_match(connection).output;
 }
 
 static void consume_player_crafting_ingredients(proto_connection_t *connection)
 {
-    proto_crafting_result_t output = evaluate_player_crafting_result(connection);
-    if (output.count == 0)
+    proto_player_crafting_match_t match = evaluate_player_crafting_match(connection);
+    if (match.output.count == 0 || match.consume_mask == 0)
     {
         return;
     }
 
-    if (output.item_id == PROTO_ITEM_OAK_PLANKS)
+    for (uint8_t grid_index = 0; grid_index < 4; grid_index++)
     {
-        for (uint8_t slot = 1; slot <= 4; slot++)
+        if ((match.consume_mask & (uint8_t)(1u << grid_index)) == 0)
         {
-            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_LOG &&
-                connection->inventory_item_counts[slot] > 0)
-            {
-                connection->inventory_item_counts[slot]--;
-                if (connection->inventory_item_counts[slot] == 0)
-                {
-                    connection->inventory_item_ids[slot] = 0;
-                }
-                break;
-            }
+            continue;
         }
-    }
-    else if (output.item_id == PROTO_ITEM_STICK)
-    {
-        uint8_t consumed = 0;
-        for (uint8_t slot = 1; slot <= 4; slot++)
+
+        uint8_t slot = (uint8_t)(grid_index + 1);
+        if (connection->inventory_item_counts[slot] == 0)
         {
-            if (connection->inventory_item_ids[slot] == PROTO_ITEM_OAK_PLANKS &&
-                connection->inventory_item_counts[slot] > 0 &&
-                consumed < 2)
-            {
-                connection->inventory_item_counts[slot]--;
-                if (connection->inventory_item_counts[slot] == 0)
-                {
-                    connection->inventory_item_ids[slot] = 0;
-                }
-                consumed++;
-            }
+            continue;
+        }
+
+        connection->inventory_item_counts[slot]--;
+        if (connection->inventory_item_counts[slot] == 0)
+        {
+            connection->inventory_item_ids[slot] = 0;
         }
     }
 }
@@ -1116,14 +1429,23 @@ static bool give_inventory_item(proto_connection_t *connection,
                                 uint16_t item_id,
                                 uint8_t count,
                                 proto_send_callback_t send_fn,
-                                void *send_context)
+                                void *send_context,
+                                uint8_t *granted_out)
 {
+    if (granted_out != NULL)
+    {
+        *granted_out = 0;
+    }
+
     if (item_id == 0 || count == 0)
     {
         return true;
     }
 
     uint8_t remaining = count;
+    uint8_t granted = 0;
+    bool all_granted = true;
+
     while (remaining > 0)
     {
         uint8_t slot = find_inventory_stack_slot(connection, item_id, PROTO_ITEM_STACK_DEFAULT);
@@ -1134,7 +1456,8 @@ static bool give_inventory_item(proto_connection_t *connection,
 
         if (slot == UINT8_MAX)
         {
-            return false;
+            all_granted = false;
+            break;
         }
 
         if (connection->inventory_item_counts[slot] == 0)
@@ -1148,6 +1471,7 @@ static bool give_inventory_item(proto_connection_t *connection,
 
         connection->inventory_item_counts[slot] = (uint8_t)(slot_count + add_count);
         remaining = (uint8_t)(remaining - add_count);
+        granted = (uint8_t)(granted + add_count);
 
         if (!send_set_slot_packet(socket_fd,
                                   0,
@@ -1157,19 +1481,31 @@ static bool give_inventory_item(proto_connection_t *connection,
                                   send_fn,
                                   send_context))
         {
+            if (granted_out != NULL)
+            {
+                *granted_out = granted;
+            }
             return false;
         }
     }
 
-    connection->inventory_dirty = true;
-    if (!persist_player_inventory_to_nvs(connection))
+    if (granted > 0)
     {
-        ESP_LOGW(TAG,
-                 "inventory persist deferred after grant: user=%s",
-                 connection->username[0] != '\0' ? connection->username : "(unknown)");
+        connection->inventory_dirty = true;
+        if (!persist_player_inventory_to_nvs(connection))
+        {
+            ESP_LOGW(TAG,
+                     "inventory persist deferred after grant: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
+        }
     }
 
-    return true;
+    if (granted_out != NULL)
+    {
+        *granted_out = granted;
+    }
+
+    return all_granted;
 }
 
 static bool set_block_override(int32_t x,
@@ -3180,12 +3516,15 @@ static void handle_play_block_dig(proto_connection_t *connection,
     uint16_t drop_item_id = world_block_to_item_id(broken_block);
     if (drop_item_id != 0)
     {
+        uint8_t granted_count = 0;
         if (!give_inventory_item(connection,
                                  socket_fd,
                                  drop_item_id,
                                  1,
                                  send_fn,
-                                 send_context))
+                                 send_context,
+                                 &granted_count) ||
+            granted_count == 0)
         {
             ESP_LOGW(TAG,
                      "inventory add failed: user=%s item=%u",
@@ -3329,6 +3668,11 @@ static void handle_play_click_window(proto_connection_t *connection,
 
     int16_t slot = (int16_t)slot_raw;
 
+    if (slot != -999 && (slot < 0 || slot > 45))
+    {
+        return;
+    }
+
     if (button == 1)
     {
         if (slot == -999)
@@ -3353,28 +3697,81 @@ static void handle_play_click_window(proto_connection_t *connection,
             return;
         }
 
-        if (connection->inventory_item_ids[slot] != 0 && connection->inventory_item_counts[slot] > 0)
+        uint16_t slot_item_id = connection->inventory_item_ids[slot];
+        uint8_t slot_count = connection->inventory_item_counts[slot];
+        bool changed = false;
+
+        if (connection->cursor_item_count == 0)
         {
-            uint8_t half = (connection->inventory_item_counts[slot] + 1) / 2;
-            connection->cursor_item_id = connection->inventory_item_ids[slot];
+            if (slot_item_id == 0 || slot_count == 0)
+            {
+                return;
+            }
+
+            uint8_t half = (uint8_t)((slot_count + 1) / 2);
+            connection->cursor_item_id = slot_item_id;
             connection->cursor_item_count = half;
-            connection->inventory_item_counts[slot] = (uint8_t)(connection->inventory_item_counts[slot] - half);
+            connection->inventory_item_counts[slot] = (uint8_t)(slot_count - half);
             if (connection->inventory_item_counts[slot] == 0)
             {
                 connection->inventory_item_ids[slot] = 0;
             }
-            if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context) ||
-                !send_cursor_update(socket_fd, connection, send_fn, send_context))
+            changed = true;
+        }
+        else
+        {
+            uint16_t cursor_item_id = connection->cursor_item_id;
+
+            if (slot_count == 0)
+            {
+                connection->inventory_item_ids[slot] = cursor_item_id;
+                connection->inventory_item_counts[slot] = 1;
+                connection->cursor_item_count--;
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+                changed = true;
+            }
+            else if (slot_item_id == cursor_item_id && slot_count < PROTO_ITEM_STACK_DEFAULT)
+            {
+                connection->inventory_item_counts[slot] = (uint8_t)(slot_count + 1);
+                connection->cursor_item_count--;
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+                changed = true;
+            }
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        if (!send_inventory_slot_update(socket_fd, slot, connection, send_fn, send_context) ||
+            !send_cursor_update(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+
+        if (slot >= 1 && slot <= 4)
+        {
+            if (!sync_player_crafting_slots(socket_fd, connection, send_fn, send_context))
             {
                 connection->close_requested = true;
                 return;
             }
-            connection->inventory_dirty = true;
-            if (persist_player_inventory_to_nvs(connection))
-            {
-                connection->inventory_dirty = false;
-            }
         }
+
+        connection->inventory_dirty = true;
+        if (persist_player_inventory_to_nvs(connection))
+        {
+            connection->inventory_dirty = false;
+        }
+
         return;
     }
 
@@ -3394,11 +3791,6 @@ static void handle_play_click_window(proto_connection_t *connection,
                 connection->inventory_dirty = false;
             }
         }
-        return;
-    }
-
-    if (slot < 0 || slot > 45)
-    {
         return;
     }
 
@@ -3483,6 +3875,14 @@ static uint8_t item_id_to_block_id(uint16_t item_id)
         return BLOCK_OAK_LEAVES;
     case PROTO_ITEM_DIAMOND:
         return BLOCK_DIAMOND_ORE;
+    case PROTO_ITEM_OAK_PLANKS:
+        return BLOCK_OAK_PLANKS;
+    case PROTO_ITEM_SPRUCE_PLANKS:
+        return BLOCK_SPRUCE_PLANKS;
+    case PROTO_ITEM_CRAFTING_TABLE:
+        return BLOCK_CRAFTING_TABLE;
+    case PROTO_ITEM_FURNACE:
+        return BLOCK_FURNACE;
     default:
         return BLOCK_AIR;
     }
@@ -4029,6 +4429,124 @@ bool proto_send_health_update(int socket_fd,
                               void *send_context)
 {
     return send_update_health_packet(socket_fd, player, send_fn, send_context);
+}
+
+static bool item_name_equals(const char *value, const char *expected)
+{
+    if (value == NULL || expected == NULL)
+    {
+        return false;
+    }
+
+    const char *lhs = value;
+    const char *colon = strchr(lhs, ':');
+    if (colon != NULL && colon[1] != '\0')
+    {
+        lhs = colon + 1;
+    }
+
+    const char *rhs = expected;
+    while (*lhs != '\0' && *rhs != '\0')
+    {
+        char left = (char)tolower((unsigned char)*lhs);
+        char right = (char)tolower((unsigned char)*rhs);
+
+        if (left == '-')
+        {
+            left = '_';
+        }
+        if (right == '-')
+        {
+            right = '_';
+        }
+
+        if (left != right)
+        {
+            return false;
+        }
+
+        lhs++;
+        rhs++;
+    }
+
+    return *lhs == '\0' && *rhs == '\0';
+}
+
+bool proto_resolve_item_name(const char *item_name, uint16_t *item_id_out)
+{
+    if (item_name == NULL || item_name[0] == '\0' || item_id_out == NULL)
+    {
+        return false;
+    }
+
+    char *parse_end = NULL;
+    unsigned long numeric_id = strtoul(item_name, &parse_end, 10);
+    if (parse_end != item_name && *parse_end == '\0' && numeric_id > 0 && numeric_id <= UINT16_MAX)
+    {
+        *item_id_out = (uint16_t)numeric_id;
+        return true;
+    }
+
+    for (size_t index = 0; index < PROTO_ITEM_NAME_ENTRY_COUNT; index++)
+    {
+        if (item_name_equals(item_name, s_item_name_entries[index].name))
+        {
+            *item_id_out = s_item_name_entries[index].item_id;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool proto_give_item(proto_connection_t *connection,
+                     int socket_fd,
+                     uint16_t item_id,
+                     uint16_t amount,
+                     proto_send_callback_t send_fn,
+                     void *send_context,
+                     uint16_t *granted_amount_out)
+{
+    if (granted_amount_out != NULL)
+    {
+        *granted_amount_out = 0;
+    }
+
+    if (connection == NULL || send_fn == NULL || item_id == 0 || amount == 0)
+    {
+        return false;
+    }
+
+    uint16_t total_granted = 0;
+    uint16_t remaining = amount;
+
+    while (remaining > 0)
+    {
+        uint8_t chunk = remaining > UINT8_MAX ? UINT8_MAX : (uint8_t)remaining;
+        uint8_t chunk_granted = 0;
+        bool chunk_complete = give_inventory_item(connection,
+                                                  socket_fd,
+                                                  item_id,
+                                                  chunk,
+                                                  send_fn,
+                                                  send_context,
+                                                  &chunk_granted);
+
+        total_granted = (uint16_t)(total_granted + chunk_granted);
+        remaining = (uint16_t)(remaining - chunk_granted);
+
+        if (!chunk_complete || chunk_granted == 0)
+        {
+            break;
+        }
+    }
+
+    if (granted_amount_out != NULL)
+    {
+        *granted_amount_out = total_granted;
+    }
+
+    return total_granted == amount;
 }
 
 void proto_server_save_world(void)

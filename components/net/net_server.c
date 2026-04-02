@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -16,6 +18,7 @@
 #include "lwip/tcp.h"
 
 #include "proto_framing.h"
+#include "proto_profile.h"
 #include "proto_server.h"
 #include "server_limits.h"
 
@@ -42,6 +45,8 @@ typedef struct
 
 static const char *TAG = "net_server";
 static net_server_state_t s_server;
+
+static bool username_equals_ignore_case(const char *left, const char *right);
 
 static int count_online_players(const net_server_state_t *server)
 {
@@ -73,6 +78,19 @@ static bool set_non_blocking(int socket_fd)
 
     int one = 1;
     setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    int send_buffer = 32 * 1024;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) < 0)
+    {
+        ESP_LOGW(TAG, "failed to set SO_SNDBUF: fd=%d errno=%d", socket_fd, errno);
+    }
+
+    int recv_buffer = 8 * 1024;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer, sizeof(recv_buffer)) < 0)
+    {
+        ESP_LOGW(TAG, "failed to set SO_RCVBUF: fd=%d errno=%d", socket_fd, errno);
+    }
+
     return true;
 }
 
@@ -83,6 +101,7 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
     size_t sent = 0;
     uint32_t stalled_retries = 0;
     uint32_t max_stalled_retries = SERVER_SOCKET_SEND_STALL_RETRIES * 5;
+    TickType_t stall_started_ticks = 0;
 
     if (length > 2048)
     {
@@ -104,25 +123,62 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
         {
             sent += (size_t)result;
             stalled_retries = 0;
+            stall_started_ticks = 0;
             continue;
         }
 
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
+            if (stall_started_ticks == 0)
+            {
+                stall_started_ticks = xTaskGetTickCount();
+            }
+
             stalled_retries++;
-            if (stalled_retries > max_stalled_retries)
+            uint32_t stalled_ms = (uint32_t)((xTaskGetTickCount() - stall_started_ticks) * portTICK_PERIOD_MS);
+            if (stalled_retries > max_stalled_retries ||
+                stalled_ms >= SERVER_SOCKET_SEND_STALL_TIMEOUT_MS)
             {
                 ESP_LOGW(TAG,
-                         "send stalled: fd=%d sent=%u/%u retries=%u",
+                         "send stalled: fd=%d sent=%u/%u retries=%u stalled_ms=%u",
                          socket_fd,
                          (unsigned int)sent,
                          (unsigned int)length,
-                         (unsigned int)stalled_retries);
+                         (unsigned int)stalled_retries,
+                         (unsigned int)stalled_ms);
                 return false;
             }
 
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
+            fd_set write_fds;
+            FD_ZERO(&write_fds);
+            FD_SET(socket_fd, &write_fds);
+
+            struct timeval wait_timeout = {
+                .tv_sec = 0,
+                .tv_usec = (int)(SERVER_SOCKET_SEND_WAIT_SLICE_MS * 1000),
+            };
+
+            int ready = select(socket_fd + 1, NULL, &write_fds, NULL, &wait_timeout);
+            if (ready > 0)
+            {
+                continue;
+            }
+            if (ready == 0)
+            {
+                continue;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            ESP_LOGW(TAG,
+                     "send wait failed: fd=%d sent=%u/%u errno=%d",
+                     socket_fd,
+                     (unsigned int)sent,
+                     (unsigned int)length,
+                     errno);
+            return false;
         }
 
         if (result < 0 && errno == EINTR)
@@ -421,6 +477,190 @@ static void accept_new_clients(net_server_state_t *server)
     }
 }
 
+static bool send_system_chat_to_client(net_server_state_t *server,
+                                       int socket_fd,
+                                       const char *message)
+{
+    if (message == NULL || message[0] == '\0')
+    {
+        return true;
+    }
+
+    uint8_t framed_packet[SERVER_MAX_INBOUND_PACKET_SIZE + 8];
+    size_t framed_packet_length = 0;
+    if (!proto_build_chat_packet(message,
+                                 0,
+                                 0,
+                                 framed_packet,
+                                 sizeof(framed_packet),
+                                 &framed_packet_length))
+    {
+        return false;
+    }
+
+    return socket_send_all(server, socket_fd, framed_packet, framed_packet_length);
+}
+
+static bool try_handle_player_chat_command(net_server_state_t *server,
+                                           net_client_t *issuer,
+                                           const uint8_t *packet,
+                                           size_t packet_length,
+                                           uint64_t now_ms)
+{
+    if (!issuer->in_use ||
+        issuer->protocol.state != PROTO_STATE_PLAY ||
+        !issuer->protocol.joined_play)
+    {
+        return false;
+    }
+
+    proto_reader_t reader;
+    proto_reader_init(&reader, packet, packet_length);
+
+    int32_t packet_id = 0;
+    if (!proto_read_varint(&reader, &packet_id))
+    {
+        return false;
+    }
+
+    const proto_profile_t *profile = proto_profile_default();
+    if (packet_id != profile->c2s_play_chat)
+    {
+        return false;
+    }
+
+    char chat_message[SERVER_MAX_CHAT_MESSAGE_LENGTH + 1];
+    if (!proto_read_string(&reader, chat_message, sizeof(chat_message)))
+    {
+        return false;
+    }
+
+    const char *args = NULL;
+    if (strncmp(chat_message, "/give ", 6) == 0)
+    {
+        args = chat_message + 6;
+    }
+    else if (strncmp(chat_message, "give ", 5) == 0)
+    {
+        args = chat_message + 5;
+    }
+    else
+    {
+        return false;
+    }
+
+    while (*args == ' ' || *args == '\t')
+    {
+        args++;
+    }
+
+    issuer->protocol.last_activity_ms = now_ms;
+
+    if (*args == '\0')
+    {
+        if (!send_system_chat_to_client(server,
+                                        issuer->socket_fd,
+                                        "Usage: /give <target|@a|@s> <item_name> <amount>"))
+        {
+            issuer->protocol.close_requested = true;
+        }
+        return true;
+    }
+
+    char args_copy[SERVER_MAX_CHAT_MESSAGE_LENGTH + 1];
+    snprintf(args_copy, sizeof(args_copy), "%s", args);
+
+    char *save_ptr = NULL;
+    char *target = strtok_r(args_copy, " \t", &save_ptr);
+    char *item_name = strtok_r(NULL, " \t", &save_ptr);
+    char *amount_text = strtok_r(NULL, " \t", &save_ptr);
+    char *extra = strtok_r(NULL, " \t", &save_ptr);
+
+    if (target == NULL || item_name == NULL || amount_text == NULL || extra != NULL)
+    {
+        if (!send_system_chat_to_client(server,
+                                        issuer->socket_fd,
+                                        "Usage: /give <target|@a|@s> <item_name> <amount>"))
+        {
+            issuer->protocol.close_requested = true;
+        }
+        return true;
+    }
+
+    char *amount_end = NULL;
+    long parsed_amount = strtol(amount_text, &amount_end, 10);
+    if (amount_end == amount_text || *amount_end != '\0' || parsed_amount <= 0 || parsed_amount > 65535)
+    {
+        if (!send_system_chat_to_client(server,
+                                        issuer->socket_fd,
+                                        "Invalid amount. Expected 1..65535"))
+        {
+            issuer->protocol.close_requested = true;
+        }
+        return true;
+    }
+
+    const char *resolved_target = target;
+    if (username_equals_ignore_case(target, "@s"))
+    {
+        resolved_target = issuer->protocol.username;
+    }
+
+    uint16_t players_affected = 0;
+    uint32_t items_granted = 0;
+    esp_err_t err = net_server_give_item(resolved_target,
+                                         item_name,
+                                         (uint16_t)parsed_amount,
+                                         &players_affected,
+                                         &items_granted);
+
+    char feedback[160];
+    if (err == ESP_OK)
+    {
+        snprintf(feedback,
+                 sizeof(feedback),
+                 "Given %u x %s to %u player(s)",
+                 (unsigned int)parsed_amount,
+                 item_name,
+                 (unsigned int)players_affected);
+    }
+    else if (err == ESP_ERR_INVALID_ARG)
+    {
+        snprintf(feedback,
+                 sizeof(feedback),
+                 "Unknown item or invalid args. Usage: /give <target|@a|@s> <item_name> <amount>");
+    }
+    else if (err == ESP_ERR_NOT_FOUND)
+    {
+        snprintf(feedback,
+                 sizeof(feedback),
+                 "No matching online player for target '%s'",
+                 resolved_target);
+    }
+    else if (err == ESP_ERR_NO_MEM)
+    {
+        snprintf(feedback,
+                 sizeof(feedback),
+                 "Partial give: granted %lu item(s) to %u player(s)",
+                 (unsigned long)items_granted,
+                 (unsigned int)players_affected);
+    }
+    else
+    {
+        snprintf(feedback,
+                 sizeof(feedback),
+                 "Give failed: %s",
+                 esp_err_to_name(err));
+    }
+
+    if (!send_system_chat_to_client(server, issuer->socket_fd, feedback))
+    {
+        issuer->protocol.close_requested = true;
+    }
+
+    return true;
+}
+
 static void process_stream_packets(net_server_state_t *server,
                                    net_client_t *client,
                                    uint64_t now_ms)
@@ -446,6 +686,17 @@ static void process_stream_packets(net_server_state_t *server,
             ESP_LOGW(TAG, "invalid packet framing, disconnecting client");
             close_client_with_reason(server, client, "invalid packet framing");
             return;
+        }
+
+        if (try_handle_player_chat_command(server, client, packet, packet_length, now_ms))
+        {
+            if (client->protocol.close_requested)
+            {
+                close_client_with_reason(server, client, "protocol requested close");
+                return;
+            }
+
+            continue;
         }
 
         proto_server_info_t server_info;
@@ -743,6 +994,122 @@ bool net_server_is_running(void)
 uint8_t net_server_online_players(void)
 {
     return (uint8_t)count_online_players(&s_server);
+}
+
+static bool username_equals_ignore_case(const char *left, const char *right)
+{
+    if (left == NULL || right == NULL)
+    {
+        return false;
+    }
+
+    while (*left != '\0' && *right != '\0')
+    {
+        char lhs = (char)tolower((unsigned char)*left);
+        char rhs = (char)tolower((unsigned char)*right);
+        if (lhs != rhs)
+        {
+            return false;
+        }
+
+        left++;
+        right++;
+    }
+
+    return *left == '\0' && *right == '\0';
+}
+
+esp_err_t net_server_give_item(const char *target,
+                               const char *item_name,
+                               uint16_t amount,
+                               uint16_t *players_affected_out,
+                               uint32_t *items_granted_out)
+{
+    if (players_affected_out != NULL)
+    {
+        *players_affected_out = 0;
+    }
+
+    if (items_granted_out != NULL)
+    {
+        *items_granted_out = 0;
+    }
+
+    if (target == NULL || target[0] == '\0' || item_name == NULL || item_name[0] == '\0' || amount == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_server.running)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t item_id = 0;
+    if (!proto_resolve_item_name(item_name, &item_id))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool target_all_players = username_equals_ignore_case(target, "@a");
+    uint16_t affected = 0;
+    uint32_t total_granted = 0;
+    bool all_complete = true;
+
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *client = &s_server.clients[i];
+        if (!client->in_use ||
+            client->protocol.state != PROTO_STATE_PLAY ||
+            !client->protocol.joined_play)
+        {
+            continue;
+        }
+
+        if (!target_all_players && !username_equals_ignore_case(client->protocol.username, target))
+        {
+            continue;
+        }
+
+        uint16_t granted_for_player = 0;
+        bool complete = proto_give_item(&client->protocol,
+                                        client->socket_fd,
+                                        item_id,
+                                        amount,
+                                        socket_send_all,
+                                        &s_server,
+                                        &granted_for_player);
+
+        affected++;
+        total_granted += granted_for_player;
+
+        if (!complete)
+        {
+            all_complete = false;
+        }
+    }
+
+    if (players_affected_out != NULL)
+    {
+        *players_affected_out = affected;
+    }
+
+    if (items_granted_out != NULL)
+    {
+        *items_granted_out = total_granted;
+    }
+
+    if (affected == 0)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (total_granted == 0)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    return all_complete ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t net_server_broadcast_chat(const char *message)

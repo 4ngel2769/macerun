@@ -147,3 +147,13 @@ bool proto_send_health_update(int socket_fd,
                               const proto_connection_t *player,
                               proto_send_callback_t send_fn,
                               void *send_context);
+
+bool proto_resolve_item_name(const char *item_name, uint16_t *item_id_out);
+
+bool proto_give_item(proto_connection_t *connection,
+                     int socket_fd,
+                     uint16_t item_id,
+                     uint16_t amount,
+                     proto_send_callback_t send_fn,
+                     void *send_context,
+                     uint16_t *granted_amount_out);

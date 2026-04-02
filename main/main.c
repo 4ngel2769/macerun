@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -369,7 +370,7 @@ static void print_shell_help(void)
 
 static void print_mc_help(void)
 {
-    ESP_LOGW(TAG, "MC root commands: help, status, list, start, stop, say <message>, exit");
+    ESP_LOGW(TAG, "MC root commands: help, status, list, start, stop, say <message>, /give <target|@a> <item_name> <amount>, exit");
 }
 
 static void print_server_status(void)
@@ -463,6 +464,86 @@ static void handle_mc_command(const char *command, bool *mc_root_mode)
         {
             ESP_LOGW(TAG, "Broadcast failed: %s", esp_err_to_name(err));
         }
+        return;
+    }
+
+    if (strncmp(command, "/give ", 6) == 0 || strncmp(command, "give ", 5) == 0)
+    {
+        const char *args = (command[0] == '/') ? (command + 6) : (command + 5);
+        while (*args == ' ' || *args == '\t')
+        {
+            args++;
+        }
+
+        if (*args == '\0')
+        {
+            ESP_LOGW(TAG, "Usage: /give <target|@a> <item_name> <amount>");
+            return;
+        }
+
+        char args_copy[SERIAL_LINE_MAX];
+        snprintf(args_copy, sizeof(args_copy), "%s", args);
+
+        char *save_ptr = NULL;
+        char *target = strtok_r(args_copy, " \t", &save_ptr);
+        char *item_name = strtok_r(NULL, " \t", &save_ptr);
+        char *amount_text = strtok_r(NULL, " \t", &save_ptr);
+        char *extra = strtok_r(NULL, " \t", &save_ptr);
+
+        if (target == NULL || item_name == NULL || amount_text == NULL || extra != NULL)
+        {
+            ESP_LOGW(TAG, "Usage: /give <target|@a> <item_name> <amount>");
+            return;
+        }
+
+        char *amount_end = NULL;
+        long parsed_amount = strtol(amount_text, &amount_end, 10);
+        if (amount_end == amount_text || *amount_end != '\0' || parsed_amount <= 0 || parsed_amount > 65535)
+        {
+            ESP_LOGW(TAG, "Invalid amount '%s'. Expected 1..65535", amount_text);
+            return;
+        }
+
+        uint16_t players_affected = 0;
+        uint32_t items_granted = 0;
+        esp_err_t err = net_server_give_item(target,
+                                             item_name,
+                                             (uint16_t)parsed_amount,
+                                             &players_affected,
+                                             &items_granted);
+
+        if (err == ESP_OK)
+        {
+            ESP_LOGW(TAG,
+                     "Given %u x %s to %u player(s)",
+                     (unsigned int)parsed_amount,
+                     item_name,
+                     (unsigned int)players_affected);
+        }
+        else if (err == ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW(TAG, "Server is not running");
+        }
+        else if (err == ESP_ERR_INVALID_ARG)
+        {
+            ESP_LOGW(TAG, "Unknown item or invalid arguments. Usage: /give <target|@a> <item_name> <amount>");
+        }
+        else if (err == ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGW(TAG, "No matching online player found for target '%s'", target);
+        }
+        else if (err == ESP_ERR_NO_MEM)
+        {
+            ESP_LOGW(TAG,
+                     "Partial give: granted %lu total item(s) to %u player(s); some inventories may be full",
+                     (unsigned long)items_granted,
+                     (unsigned int)players_affected);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Give failed: %s", esp_err_to_name(err));
+        }
+
         return;
     }
 

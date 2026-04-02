@@ -19,3 +19,8 @@ void net_server_stop(void);
 bool net_server_is_running(void);
 uint8_t net_server_online_players(void);
 esp_err_t net_server_broadcast_chat(const char *message);
+esp_err_t net_server_give_item(const char *target,
+                               const char *item_name,
+                               uint16_t amount,
+                               uint16_t *players_affected_out,
+                               uint32_t *items_granted_out);
