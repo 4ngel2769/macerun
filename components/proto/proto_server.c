@@ -1024,24 +1024,9 @@ static void pack_heightmap(const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_C
 static bool write_chunk_heightmaps_nbt(proto_writer_t *writer,
                                        const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT])
 {
-    uint64_t packed_unsigned[PROTO_HEIGHTMAP_LONG_COUNT];
-    int64_t packed_signed[PROTO_HEIGHTMAP_LONG_COUNT];
-
-    pack_heightmap(height_samples, packed_unsigned);
-    for (size_t i = 0; i < PROTO_HEIGHTMAP_LONG_COUNT; i++)
-    {
-        packed_signed[i] = (int64_t)packed_unsigned[i];
-    }
+    (void)height_samples;
 
     return nbt_begin_named_compound(writer, "") &&
-           nbt_write_named_long_array(writer,
-                                      "MOTION_BLOCKING",
-                                      packed_signed,
-                                      PROTO_HEIGHTMAP_LONG_COUNT) &&
-           nbt_write_named_long_array(writer,
-                                      "WORLD_SURFACE",
-                                      packed_signed,
-                                      PROTO_HEIGHTMAP_LONG_COUNT) &&
            nbt_end_compound(writer);
 }
 
@@ -1230,7 +1215,7 @@ static bool send_map_chunk_packet(int socket_fd,
 
     for (int32_t i = 0; i < PROTO_BIOME_ARRAY_COUNT; i++)
     {
-        if (!proto_write_varint(&writer, 1))
+        if (!proto_write_varint(&writer, 0))
         {
             ESP_LOGW(TAG,
                      "chunk biome write failed at (%ld,%ld): index=%ld",
@@ -1278,12 +1263,12 @@ static bool send_update_light_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
-    memset(s_proto_full_sky_light_section, 0xFF, sizeof(s_proto_full_sky_light_section));
-
-    int32_t sky_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
+    int32_t sky_light_mask = 0;
     int32_t block_light_mask = 0;
-    int32_t empty_sky_light_mask = 0;
+    int32_t empty_sky_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
     int32_t empty_block_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
+    int32_t sky_light_array_count = 0;
+    int32_t block_light_array_count = 0;
 
     if (!proto_write_varint(&writer, active_profile()->s2c_play_update_light) ||
         !proto_write_varint(&writer, chunk_x) ||
@@ -1293,35 +1278,11 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, block_light_mask) ||
         !proto_write_varint(&writer, empty_sky_light_mask) ||
         !proto_write_varint(&writer, empty_block_light_mask) ||
-        !proto_write_varint(&writer, PROTO_LIGHT_SECTION_COUNT))
+        !proto_write_varint(&writer, sky_light_array_count) ||
+        !proto_write_varint(&writer, block_light_array_count))
     {
         ESP_LOGW(TAG,
                  "light packet write failed at (%ld,%ld)",
-                 (long)chunk_x,
-                 (long)chunk_z);
-        return false;
-    }
-
-    for (int32_t i = 0; i < PROTO_LIGHT_SECTION_COUNT; i++)
-    {
-        if (!proto_write_varint(&writer, sizeof(s_proto_full_sky_light_section)) ||
-            !proto_write_bytes(&writer,
-                               s_proto_full_sky_light_section,
-                               sizeof(s_proto_full_sky_light_section)))
-        {
-            ESP_LOGW(TAG,
-                     "light sky array write failed at (%ld,%ld): section=%ld",
-                     (long)chunk_x,
-                     (long)chunk_z,
-                     (long)i);
-            return false;
-        }
-    }
-
-    if (!proto_write_varint(&writer, 0))
-    {
-        ESP_LOGW(TAG,
-                 "light block array write failed at (%ld,%ld)",
                  (long)chunk_x,
                  (long)chunk_z);
         return false;
@@ -1376,7 +1337,7 @@ static bool write_plains_biome_element_compound(proto_writer_t *writer)
 static bool write_plains_biome_registry_entry(proto_writer_t *writer)
 {
     return nbt_write_named_string(writer, "name", "minecraft:plains") &&
-           nbt_write_named_int(writer, "id", 1) &&
+           nbt_write_named_int(writer, "id", 0) &&
            nbt_begin_named_compound(writer, "element") &&
            write_plains_biome_element_compound(writer) &&
            nbt_end_compound(writer);
@@ -2176,21 +2137,21 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
     if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
     {
         ESP_LOGW(TAG,
-                 "chunk send failed at (%ld,%ld); will retry",
+                 "chunk send failed at (%ld,%ld); closing session",
                  (long)chosen_chunk_x,
                  (long)chosen_chunk_z);
-        connection->chunk_scan_index = (uint16_t)((best_scan_index + 1) % total);
-        return true;
+        connection->close_requested = true;
+        return false;
     }
 
     if (!send_update_light_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
     {
         ESP_LOGW(TAG,
-                 "chunk light send failed at (%ld,%ld); will retry",
+                 "chunk light send failed at (%ld,%ld); closing session",
                  (long)chosen_chunk_x,
                  (long)chosen_chunk_z);
-        connection->chunk_scan_index = (uint16_t)((best_scan_index + 1) % total);
-        return true;
+        connection->close_requested = true;
+        return false;
     }
 
     track_chunk(connection, chosen_chunk_x, chosen_chunk_z);
@@ -2239,12 +2200,27 @@ static void handle_handshake(proto_connection_t *connection, proto_reader_t *rea
     (void)server_address;
     (void)server_port;
 
+    ESP_LOGW(TAG,
+             "handshake: client_protocol=%ld next_state=%ld",
+             (long)protocol_version,
+             (long)next_state);
+
     if (next_state == active_profile()->handshake_next_state_status)
     {
         connection->state = PROTO_STATE_STATUS;
     }
     else if (next_state == active_profile()->handshake_next_state_login)
     {
+        if (protocol_version != SERVER_PROTOCOL_VERSION)
+        {
+            ESP_LOGW(TAG,
+                     "login rejected: unsupported protocol %ld (expected %u)",
+                     (long)protocol_version,
+                     (unsigned int)SERVER_PROTOCOL_VERSION);
+            connection->close_requested = true;
+            return;
+        }
+
         connection->state = PROTO_STATE_LOGIN;
     }
     else
