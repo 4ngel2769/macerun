@@ -25,6 +25,7 @@ typedef struct
     int32_t c2s_play_arm_animation;
     int32_t c2s_play_block_dig;
     int32_t c2s_play_block_place;
+    int32_t c2s_play_held_item_change;
 
     int32_t s2c_status_response;
     int32_t s2c_status_pong;

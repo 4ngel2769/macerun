@@ -62,8 +62,7 @@ typedef struct
     uint64_t chunk_unload_grace_until_ms;
     uint16_t chunk_scan_index;
     uint16_t chunk_sent_count;
-    proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];
-    uint16_t inventory_item_ids[46];
+    proto_chunk_coord_t sent_chunks[SERVER_CHUNK_TRACKED_MAX];    uint8_t selected_hotbar_slot;    uint16_t inventory_item_ids[46];
     uint8_t inventory_item_counts[46];
     char username[17];
 } proto_connection_t;
@@ -105,6 +104,8 @@ void proto_tick_connection(proto_connection_t *connection,
                            void *send_context,
                            uint64_t now_ms);
 
+void proto_tick_server(uint64_t now_ms);
+void proto_server_save_world(void);
 bool proto_build_chat_packet(const char *message_text,
                              int64_t uuid_most,
                              int64_t uuid_least,

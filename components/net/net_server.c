@@ -206,6 +206,11 @@ static void close_client_with_reason(net_server_state_t *server,
 
     close(client->socket_fd);
     memset(client, 0, sizeof(*client));
+
+    if (count_online_players(server) == 0)
+    {
+        proto_server_save_world();
+    }
 }
 
 static bool socket_broadcast_except(void *context,
@@ -694,6 +699,8 @@ static void server_task(void *arg)
 
         server->uptime_ms += SERVER_TICK_MS;
 
+        proto_tick_server(now_ms);
+
         vTaskDelay(pdMS_TO_TICKS(SERVER_TICK_MS));
     }
 
@@ -701,6 +708,8 @@ static void server_task(void *arg)
     {
         close_client_with_reason(server, &server->clients[i], "server stopping");
     }
+
+    proto_server_save_world();
 
     if (server->listen_fd >= 0)
     {
@@ -796,12 +805,13 @@ esp_err_t net_server_start(const net_server_config_t *config)
     s_server.running = true;
     s_server.config = *config;
 
-    BaseType_t ok = xTaskCreate(server_task,
+    BaseType_t ok = xTaskCreatePinnedToCore(server_task,
                                 "net_server",
                                 SERVER_NET_TASK_STACK,
                                 &s_server,
                                 SERVER_NET_TASK_PRIORITY,
-                                &s_server.task);
+                                &s_server.task,
+                                1);
     if (ok != pdPASS)
     {
         memset(&s_server, 0, sizeof(s_server));

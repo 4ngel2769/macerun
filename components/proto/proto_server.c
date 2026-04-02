@@ -9,7 +9,9 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "nvs.h"
+#include "esp_rom_md5.h"
 #include "proto_framing.h"
 #include "proto_profile.h"
 #include "server_limits.h"
@@ -71,15 +73,16 @@ typedef enum
 
 static int32_t s_next_entity_id = 1;
 static bool s_world_initialized = false;
+static bool s_world_deltas_dirty = false;
+static uint64_t s_last_world_save_ms = 0;
 static world_config_t s_world_config;
 static world_deltas_t s_world_deltas;
 static const proto_profile_t *s_proto_profile = NULL;
 static const char *TAG = "proto_server";
 
-static uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
-static uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
-static uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
-static uint8_t s_proto_full_sky_light_section[2048];
+static EXT_RAM_BSS_ATTR uint8_t s_proto_packet_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE];
+static EXT_RAM_BSS_ATTR uint8_t s_proto_framed_buffer[SERVER_MAX_OUTBOUND_PACKET_SIZE + 8];
+static EXT_RAM_BSS_ATTR uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_SIZE];
 
 static const int32_t s_chunk_palette_state_ids[] = {
     0,
@@ -266,18 +269,6 @@ static bool read_f64_be(proto_reader_t *reader, double *value)
     return true;
 }
 
-static uint64_t fnv1a64_seeded(const char *text, uint64_t seed)
-{
-    uint64_t hash = seed;
-    while (*text != '\0')
-    {
-        hash ^= (uint8_t)(*text);
-        hash *= 1099511628211ULL;
-        text++;
-    }
-    return hash;
-}
-
 static int64_t be_bytes_to_i64(const uint8_t *bytes)
 {
     uint64_t unsigned_value = 0;
@@ -290,15 +281,14 @@ static int64_t be_bytes_to_i64(const uint8_t *bytes)
 
 static void generate_offline_uuid(const char *username, int64_t *uuid_most, int64_t *uuid_least)
 {
-    uint64_t high_half = fnv1a64_seeded(username, 1469598103934665603ULL);
-    uint64_t low_half = fnv1a64_seeded(username, 1099511628211ULL ^ 0x6A09E667F3BCC909ULL);
+    char offline_str[256];
+    int len = snprintf(offline_str, sizeof(offline_str), "OfflinePlayer:%s", username);
 
     uint8_t bytes[16];
-    for (size_t index = 0; index < 8; index++)
-    {
-        bytes[index] = (uint8_t)((high_half >> (56 - (8 * index))) & 0xFF);
-        bytes[8 + index] = (uint8_t)((low_half >> (56 - (8 * index))) & 0xFF);
-    }
+    md5_context_t ctx;
+    esp_rom_md5_init(&ctx);
+    esp_rom_md5_update(&ctx, (const void *)offline_str, (uint32_t)len);
+    esp_rom_md5_final(bytes, &ctx);
 
     bytes[6] = (uint8_t)((bytes[6] & 0x0F) | 0x30);
     bytes[8] = (uint8_t)((bytes[8] & 0x3F) | 0x80);
@@ -900,10 +890,7 @@ static bool set_block_override(int32_t x,
         return false;
     }
 
-    if (!persist_world_deltas_to_nvs())
-    {
-        ESP_LOGW(TAG, "continuing with in-memory world deltas only");
-    }
+    s_world_deltas_dirty = true;
 
     *changed_out = true;
     return true;
@@ -1024,9 +1011,11 @@ static void pack_heightmap(const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_C
 static bool write_chunk_heightmaps_nbt(proto_writer_t *writer,
                                        const uint16_t height_samples[PROTO_HEIGHTMAP_ENTRY_COUNT])
 {
-    (void)height_samples;
+    uint64_t packed_heightmap[PROTO_HEIGHTMAP_LONG_COUNT];
+    pack_heightmap(height_samples, packed_heightmap);
 
     return nbt_begin_named_compound(writer, "") &&
+           nbt_write_named_long_array(writer, "MOTION_BLOCKING", (const int64_t *)packed_heightmap, PROTO_HEIGHTMAP_LONG_COUNT) &&
            nbt_end_compound(writer);
 }
 
@@ -1053,7 +1042,7 @@ static bool encode_chunk_sections(int32_t chunk_x,
     {
         int32_t section_base_y = section_index * PROTO_SECTION_HEIGHT;
         int32_t solid_block_count = 0;
-        uint8_t palette_indices[PROTO_SECTION_VOLUME] = {0};
+        static uint8_t palette_indices[PROTO_SECTION_VOLUME];
 
         for (int32_t block_index = 0; block_index < PROTO_SECTION_VOLUME; block_index++)
         {
@@ -1215,7 +1204,7 @@ static bool send_map_chunk_packet(int socket_fd,
 
     for (int32_t i = 0; i < PROTO_BIOME_ARRAY_COUNT; i++)
     {
-        if (!proto_write_varint(&writer, 0))
+        if (!proto_write_varint(&writer, 1))
         {
             ESP_LOGW(TAG,
                      "chunk biome write failed at (%ld,%ld): index=%ld",
@@ -2018,7 +2007,10 @@ static void track_chunk(proto_connection_t *connection, int32_t chunk_x, int32_t
 {
     if (connection->chunk_sent_count >= SERVER_CHUNK_TRACKED_MAX)
     {
-        connection->chunk_sent_count = 0;
+        memmove(&connection->sent_chunks[0],
+                &connection->sent_chunks[1],
+                (SERVER_CHUNK_TRACKED_MAX - 1) * sizeof(proto_chunk_coord_t));
+        connection->chunk_sent_count = SERVER_CHUNK_TRACKED_MAX - 1;
     }
 
     connection->sent_chunks[connection->chunk_sent_count].x = chunk_x;
@@ -2046,10 +2038,6 @@ static void prune_tracked_chunks(proto_connection_t *connection,
                                  void *send_context,
                                  uint64_t now_ms)
 {
-    (void)socket_fd;
-    (void)send_fn;
-    (void)send_context;
-
     bool keep_previous_center_window = connection->has_previous_chunk_center &&
                                        now_ms < connection->chunk_unload_grace_until_ms;
 
@@ -2072,6 +2060,8 @@ static void prune_tracked_chunks(proto_connection_t *connection,
             index++;
             continue;
         }
+
+        send_unload_chunk_packet(socket_fd, chunk_x, chunk_z, send_fn, send_context);
 
         uint16_t last_index = connection->chunk_sent_count - 1;
         if (index != last_index)
@@ -2134,20 +2124,20 @@ static bool send_next_chunk_for_connection(proto_connection_t *connection,
     int32_t chosen_chunk_x = connection->chunk_center_x + chosen_dx;
     int32_t chosen_chunk_z = connection->chunk_center_z + chosen_dz;
 
-    if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
+    if (!send_update_light_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
     {
         ESP_LOGW(TAG,
-                 "chunk send failed at (%ld,%ld); closing session",
+                 "chunk light send failed at (%ld,%ld); closing session",
                  (long)chosen_chunk_x,
                  (long)chosen_chunk_z);
         connection->close_requested = true;
         return false;
     }
 
-    if (!send_update_light_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
+    if (!send_map_chunk_packet(socket_fd, chosen_chunk_x, chosen_chunk_z, send_fn, send_context))
     {
         ESP_LOGW(TAG,
-                 "chunk light send failed at (%ld,%ld); closing session",
+                 "chunk send failed at (%ld,%ld); closing session",
                  (long)chosen_chunk_x,
                  (long)chosen_chunk_z);
         connection->close_requested = true;
@@ -2179,7 +2169,7 @@ void proto_connection_reset(proto_connection_t *connection)
     reset_chunk_stream_state(connection);
 }
 
-static void handle_handshake(proto_connection_t *connection, proto_reader_t *reader)
+static void handle_handshake(proto_connection_t *connection, proto_reader_t *reader, int socket_fd, proto_send_callback_t send_fn, void *send_context)
 {
     int32_t protocol_version = 0;
     int32_t next_state = 0;
@@ -2217,6 +2207,7 @@ static void handle_handshake(proto_connection_t *connection, proto_reader_t *rea
                      "login rejected: unsupported protocol %ld (expected %u)",
                      (long)protocol_version,
                      (unsigned int)SERVER_PROTOCOL_VERSION);
+            send_login_disconnect(socket_fd, "Wrong version, expected 1.16.5", send_fn, send_context);
             connection->close_requested = true;
             return;
         }
@@ -2769,6 +2760,41 @@ static void handle_play_block_dig(proto_connection_t *connection,
     }
 }
 
+static void handle_play_held_item_change(proto_connection_t *connection,
+                                         proto_reader_t *reader)
+{
+    uint16_t slot = 0;
+    if (!proto_read_u16_be(reader, &slot))
+    {
+        connection->close_requested = true;
+        return;
+    }
+
+    if (slot <= 8)
+    {
+        connection->selected_hotbar_slot = (uint8_t)slot;
+    }
+}
+
+static uint8_t item_id_to_block_id(uint16_t item_id)
+{
+    // Mapping 1.16.5 item IDs to local block IDs.
+    // Extremely simplified mapping.
+    switch (item_id)
+    {
+    case 1:  return BLOCK_STONE;
+    case 9:  return BLOCK_GRASS;
+    case 10: return BLOCK_DIRT;
+    case 21: return BLOCK_COBBLESTONE;
+    case 24: return BLOCK_SAND;
+    case 35: return BLOCK_OAK_LOG;
+    case 140:return BLOCK_OAK_LEAVES;
+    case 56: return BLOCK_DIAMOND_ORE;
+    case 80: return BLOCK_SNOW_BLOCK;
+    default: return BLOCK_COBBLESTONE;
+    }
+}
+
 static void handle_play_block_place(proto_connection_t *connection,
                                     proto_reader_t *reader,
                                     int socket_fd,
@@ -2814,10 +2840,13 @@ static void handle_play_block_place(proto_connection_t *connection,
     }
 
     bool changed = false;
+    uint16_t current_item_id = connection->inventory_item_ids[36 + connection->selected_hotbar_slot];
+    uint8_t block_id = item_id_to_block_id(current_item_id);
+
     if (!set_block_override(place_x,
                             place_y,
                             place_z,
-                            BLOCK_COBBLESTONE,
+                            block_id,
                             &changed))
     {
         ESP_LOGW(TAG,
@@ -2837,7 +2866,7 @@ static void handle_play_block_place(proto_connection_t *connection,
                          place_x,
                          place_y,
                          place_z,
-                         world_block_to_state_id(BLOCK_COBBLESTONE),
+                         world_block_to_state_id(block_id),
                          send_fn,
                          broadcast_fn,
                          send_context);
@@ -2896,6 +2925,10 @@ static void handle_play(proto_connection_t *connection,
                                 send_fn,
                                 broadcast_fn,
                                 send_context);
+    }
+    else if (packet_id == profile->c2s_play_held_item_change)
+    {
+        handle_play_held_item_change(connection, reader);
     }
 }
 
@@ -3046,7 +3079,7 @@ void proto_handle_packet(proto_connection_t *connection,
             connection->close_requested = true;
             return;
         }
-        handle_handshake(connection, &reader);
+        handle_handshake(connection, &reader, socket_fd, send_fn, send_context);
         break;
 
     case PROTO_STATE_STATUS:
@@ -3177,12 +3210,6 @@ void proto_tick_connection(proto_connection_t *connection,
     }
 
     int32_t chunk_send_budget = SERVER_CHUNK_SENDS_PER_TICK;
-    if (chunk_center_changed ||
-        !is_chunk_tracked(connection, connection->chunk_center_x, connection->chunk_center_z))
-    {
-        int32_t diameter = (SERVER_CHUNK_SEND_RADIUS * 2) + 1;
-        chunk_send_budget = diameter * diameter;
-    }
 
     for (int32_t send_index = 0; send_index < chunk_send_budget; send_index++)
     {
@@ -3261,4 +3288,24 @@ bool proto_send_health_update(int socket_fd,
                               void *send_context)
 {
     return send_update_health_packet(socket_fd, player, send_fn, send_context);
+}
+
+void proto_server_save_world(void)
+{
+    if (s_world_deltas_dirty)
+    {
+        if (persist_world_deltas_to_nvs())
+        {
+            s_world_deltas_dirty = false;
+        }
+    }
+}
+
+void proto_tick_server(uint64_t now_ms)
+{
+    if (s_world_deltas_dirty && (now_ms - s_last_world_save_ms > 600000ULL))
+    {
+        proto_server_save_world();
+        s_last_world_save_ms = now_ms;
+    }
 }

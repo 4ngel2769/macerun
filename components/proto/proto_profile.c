@@ -23,6 +23,7 @@ static const proto_profile_t PROFILE_754 = {
     .c2s_play_arm_animation = 0x2C,
     .c2s_play_block_dig = 0x1B,
     .c2s_play_block_place = 0x2E,
+    .c2s_play_held_item_change = 0x25,
 
     .s2c_status_response = 0x00,
     .s2c_status_pong = 0x01,
