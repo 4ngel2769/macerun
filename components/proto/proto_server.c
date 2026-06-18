@@ -232,6 +232,7 @@ static void ensure_world_initialized(void)
         ESP_LOGW(TAG, "world delta restore failed; starting with empty overrides");
     }
     proto_container_init();
+    proto_entity_init();
     s_world_initialized = true;
 }
 
@@ -393,6 +394,28 @@ static int32_t next_entity_id(void)
         s_next_entity_id = 1;
     }
     return entity_id;
+}
+
+int32_t proto_next_entity_id(void)
+{
+    return next_entity_id();
+}
+
+uint8_t proto_query_block_id(int32_t x, int32_t y, int32_t z)
+{
+    ensure_world_initialized();
+    uint8_t block_id = 0;
+    if (world_deltas_get(&s_world_deltas, x, y, z, &block_id))
+    {
+        return block_id;
+    }
+    return world_query_block(&s_world_config, x, y, z);
+}
+
+int16_t proto_query_surface_y(int32_t x, int32_t z)
+{
+    ensure_world_initialized();
+    return world_query_surface_y(&s_world_config, x, z);
 }
 
 static bool escape_json_text(const char *input, char *output, size_t output_size)

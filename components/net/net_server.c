@@ -20,6 +20,7 @@
 #include "proto_framing.h"
 #include "proto_profile.h"
 #include "proto_server.h"
+#include "proto_entity.h"
 #include "server_limits.h"
 
 #define NET_ATTACK_COOLDOWN_MS 500ULL
@@ -47,6 +48,35 @@ static const char *TAG = "net_server";
 static net_server_state_t s_server;
 
 static bool username_equals_ignore_case(const char *left, const char *right);
+
+static void mob_damage_player_callback(int32_t target_player_entity_id,
+                                        float damage)
+{
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *target = &s_server.clients[i];
+        if (!target->in_use ||
+            !target->protocol.joined_play ||
+            target->protocol.state != PROTO_STATE_PLAY)
+        {
+            continue;
+        }
+
+        if (target->protocol.entity_id != target_player_entity_id)
+        {
+            continue;
+        }
+
+        target->protocol.health -= damage;
+        if (target->protocol.health < 0.0f)
+        {
+            target->protocol.health = 0.0f;
+        }
+        target->protocol.health_dirty = true;
+
+        break;
+    }
+}
 
 static int count_online_players(const net_server_state_t *server)
 {
@@ -409,6 +439,13 @@ static void process_pending_interaction_events(net_server_state_t *server,
     net_client_t *target = find_client_by_entity_id(server, target_entity_id);
     if (target == NULL)
     {
+        if (target_entity_id >= 1000)
+        {
+            if (proto_entity_damage_mob(target_entity_id, PROTO_MOB_PLAYER_DAMAGE))
+            {
+                broadcast_entity_animation(server, client->protocol.entity_id, 1);
+            }
+        }
         return;
     }
 
@@ -966,6 +1003,30 @@ static void server_task(void *arg)
             mover->protocol.prev_pos_y = mover->protocol.pos_y;
             mover->protocol.prev_pos_z = mover->protocol.pos_z;
         }
+
+        proto_entity_player_view_t player_views[SERVER_MAX_PLAYERS];
+        int view_count = 0;
+        int player_fds[SERVER_MAX_PLAYERS];
+        int fd_count = 0;
+
+        for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+        {
+            if (server->clients[i].in_use &&
+                server->clients[i].protocol.state == PROTO_STATE_PLAY &&
+                server->clients[i].protocol.joined_play)
+            {
+                player_views[view_count].entity_id = server->clients[i].protocol.entity_id;
+                player_views[view_count].pos_x = server->clients[i].protocol.pos_x;
+                player_views[view_count].pos_y = server->clients[i].protocol.pos_y;
+                player_views[view_count].pos_z = server->clients[i].protocol.pos_z;
+                view_count++;
+                player_fds[fd_count++] = server->clients[i].socket_fd;
+            }
+        }
+
+        proto_entity_tick(now_ms, player_views, view_count, mob_damage_player_callback);
+
+        proto_entity_broadcast_updates(player_fds, fd_count, socket_send_all, server);
 
         server->uptime_ms += SERVER_TICK_MS;
 

@@ -57,6 +57,8 @@ static const proto_profile_t PROFILE_754 = {
     .s2c_play_window_items     = 0x14,
     .s2c_play_close_window     = 0x12,
     .s2c_play_respawn          = 0x3D,
+    .s2c_play_spawn_mob        = 0x3F,
+    .s2c_play_entity_velocity  = 0x46,
 
     .supports_light_trust_edges = true,
 };

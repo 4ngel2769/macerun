@@ -37,8 +37,11 @@ idf.py flash monitor
 - [x] Player Persistence: Saving player data upon disconnecting (coordinates, health, hunger, and inventory items).
 - [ ] Advanced Crafting: 3x3 crafting grid support.
 - [x] Containers: Chests and block inventory management.
-- [ ] Entities: Mobs, spawning, and mob AI.
+- [x] Entities: Mobs, spawning, mob AI, and combat (player ↔ mob damage).
 - [x] Respawning: Handling player death and the respawn.
+- [ ] Furnace smelting and cooking.
+- [ ] Item drops on player death.
+- [ ] Day/night cycle and weather.
 
 ## License
 

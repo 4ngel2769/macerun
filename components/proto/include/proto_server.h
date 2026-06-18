@@ -6,6 +6,7 @@
 
 #include "server_limits.h"
 #include "proto_framing.h"
+#include "proto_entity.h"
 
 typedef struct
 {
@@ -192,3 +193,9 @@ void proto_handle_client_status(proto_connection_t *connection,
                                 void *send_context);
 
 bool persist_player_data_to_nvs(const proto_connection_t *connection);
+
+int32_t proto_next_entity_id(void);
+
+uint8_t proto_query_block_id(int32_t x, int32_t y, int32_t z);
+
+int16_t proto_query_surface_y(int32_t x, int32_t z);
