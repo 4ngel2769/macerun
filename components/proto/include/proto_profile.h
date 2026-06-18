@@ -27,6 +27,7 @@ typedef struct
     int32_t c2s_play_block_place;
     int32_t c2s_play_held_item_change;
     int32_t c2s_play_click_window;
+    int32_t c2s_play_close_window;
 
     int32_t s2c_status_response;
     int32_t s2c_status_pong;
@@ -45,6 +46,9 @@ typedef struct
     int32_t s2c_play_set_slot;
     int32_t s2c_play_update_health;
     int32_t s2c_play_ack_dig;
+    int32_t s2c_play_open_window;
+    int32_t s2c_play_window_items;
+    int32_t s2c_play_close_window;
 
     /* multiplayer entity packets*/
     int32_t s2c_play_player_info;      /* 0x32*/

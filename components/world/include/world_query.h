@@ -28,6 +28,7 @@ typedef enum
     BLOCK_CRAFTING_TABLE = 58,
     BLOCK_FURNACE = 61,
     BLOCK_SNOW_BLOCK = 80,
+    BLOCK_CHEST = 131,
 } world_block_id_t;
 
 typedef struct

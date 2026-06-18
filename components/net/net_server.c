@@ -260,6 +260,11 @@ static void close_client_with_reason(net_server_state_t *server,
                  client->socket_fd, safe_reason);
     }
 
+    if (client->protocol.joined_play && client->protocol.username[0] != '\0')
+    {
+        persist_player_data_to_nvs(&client->protocol);
+    }
+
     close(client->socket_fd);
     memset(client, 0, sizeof(*client));
 

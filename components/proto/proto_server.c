@@ -20,6 +20,7 @@
 #include "server_limits.h"
 #include "block_deltas.h"
 #include "world_query.h"
+#include "proto_container.h"
 
 #define PROTO_KEEPALIVE_INTERVAL_MS 5000ULL
 #define PROTO_KEEPALIVE_TIMEOUT_MS 15000ULL
@@ -57,6 +58,7 @@ typedef enum
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
 #define PROTO_INVENTORY_NVS_KEY_PREFIX "inv_"
+#define PROTO_PLAYER_DATA_NVS_KEY_PREFIX "plr_"
 #define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
 #define PROTO_CHUNK_UNLOAD_GRACE_MS 2000ULL
 #define PROTO_VOID_RECOVERY_THRESHOLD_BELOW_MIN_Y 16.0
@@ -94,6 +96,7 @@ typedef enum
 #define PROTO_ITEM_FURNACE 185
 #define PROTO_ITEM_DIAMOND 578
 #define PROTO_ITEM_SNOWBALL 666
+#define PROTO_ITEM_CHEST 485
 
 typedef struct
 {
@@ -162,6 +165,7 @@ static const int32_t s_chunk_palette_state_ids[] = {
     16,
     3356,
     3374,
+    3765,
 };
 
 #define PROTO_CHUNK_PALETTE_SIZE ((int32_t)(sizeof(s_chunk_palette_state_ids) / sizeof(s_chunk_palette_state_ids[0])))
@@ -183,6 +187,10 @@ static bool persist_world_deltas_to_nvs(void);
 static void initialize_survival_state(proto_connection_t *connection, uint64_t now_ms);
 static bool load_player_inventory_from_nvs(proto_connection_t *connection);
 static bool persist_player_inventory_to_nvs(const proto_connection_t *connection);
+static bool load_player_data_from_nvs(proto_connection_t *connection);
+bool persist_player_data_to_nvs(const proto_connection_t *connection);
+static bool serialize_player_data_to_buffer(const proto_connection_t *connection, uint8_t *buffer, size_t buffer_size);
+static bool deserialize_player_data_from_buffer(proto_connection_t *connection, const uint8_t *buffer, size_t buffer_size);
 
 static const proto_profile_t *active_profile(void)
 {
@@ -212,6 +220,7 @@ static void ensure_world_initialized(void)
     {
         ESP_LOGW(TAG, "world delta restore failed; starting with empty overrides");
     }
+    proto_container_init();
     s_world_initialized = true;
 }
 
@@ -565,6 +574,8 @@ static int32_t world_block_to_state_id(uint8_t block_id)
         return 3356;
     case BLOCK_FURNACE:
         return 3374;
+    case BLOCK_CHEST:
+        return 3765;
     default:
         return 1;
     }
@@ -606,6 +617,8 @@ static uint8_t world_block_to_palette_index(uint8_t block_id)
         return 14;
     case BLOCK_FURNACE:
         return 15;
+    case BLOCK_CHEST:
+        return 16;
     default:
         return 1;
     }
@@ -641,6 +654,8 @@ static uint16_t world_block_to_item_id(uint8_t block_id)
         return PROTO_ITEM_CRAFTING_TABLE;
     case BLOCK_FURNACE:
         return PROTO_ITEM_FURNACE;
+    case BLOCK_CHEST:
+        return PROTO_ITEM_CHEST;
     default:
         return 0;
     }
@@ -825,6 +840,23 @@ typedef struct
     uint8_t selected_hotbar_slot;
 } proto_inventory_blob_t;
 
+typedef struct
+{
+    double pos_x;
+    double pos_y;
+    double pos_z;
+    float yaw;
+    float pitch;
+    float health;
+    int32_t food_level;
+    float food_saturation;
+    uint16_t inventory_item_ids[46];
+    uint8_t inventory_item_counts[46];
+    uint8_t selected_hotbar_slot;
+    uint16_t cursor_item_id;
+    uint8_t cursor_item_count;
+} proto_player_data_blob_t;
+
 static uint32_t username_hash_djb2(const char *username)
 {
     uint32_t hash = 5381u;
@@ -837,8 +869,8 @@ static uint32_t username_hash_djb2(const char *username)
 }
 
 static bool inventory_nvs_key_for_username(const char *username,
-                                           char *key_out,
-                                           size_t key_out_size)
+                                            char *key_out,
+                                            size_t key_out_size)
 {
     if (username == NULL || username[0] == '\0' || key_out == NULL || key_out_size < 13)
     {
@@ -849,6 +881,23 @@ static bool inventory_nvs_key_for_username(const char *username,
     int written = snprintf(key_out,
                            key_out_size,
                            PROTO_INVENTORY_NVS_KEY_PREFIX "%08lx",
+                           (unsigned long)hash);
+    return written > 0 && written < (int)key_out_size;
+}
+
+static bool player_data_nvs_key_for_username(const char *username,
+                                            char *key_out,
+                                            size_t key_out_size)
+{
+    if (username == NULL || username[0] == '\0' || key_out == NULL || key_out_size < 13)
+    {
+        return false;
+    }
+
+    uint32_t hash = username_hash_djb2(username);
+    int written = snprintf(key_out,
+                           key_out_size,
+                           PROTO_PLAYER_DATA_NVS_KEY_PREFIX "%08lx",
                            (unsigned long)hash);
     return written > 0 && written < (int)key_out_size;
 }
@@ -949,6 +998,162 @@ static bool persist_player_inventory_to_nvs(const proto_connection_t *connection
     return true;
 }
 
+static bool serialize_player_data_to_buffer(const proto_connection_t *connection, uint8_t *buffer, size_t buffer_size)
+{
+    if (connection == NULL || buffer == NULL || buffer_size < sizeof(proto_player_data_blob_t))
+    {
+        return false;
+    }
+
+    proto_player_data_blob_t blob;
+    blob.pos_x = connection->pos_x;
+    blob.pos_y = connection->pos_y;
+    blob.pos_z = connection->pos_z;
+    blob.yaw = connection->yaw;
+    blob.pitch = connection->pitch;
+    blob.health = connection->health;
+    blob.food_level = connection->food_level;
+    blob.food_saturation = connection->food_saturation;
+    
+    memcpy(blob.inventory_item_ids, connection->inventory_item_ids, sizeof(blob.inventory_item_ids));
+    memcpy(blob.inventory_item_counts, connection->inventory_item_counts, sizeof(blob.inventory_item_counts));
+    blob.selected_hotbar_slot = connection->selected_hotbar_slot;
+    blob.cursor_item_id = connection->cursor_item_id;
+    blob.cursor_item_count = connection->cursor_item_count;
+
+    memcpy(buffer, &blob, sizeof(blob));
+    return true;
+}
+
+static bool deserialize_player_data_from_buffer(proto_connection_t *connection, const uint8_t *buffer, size_t buffer_size)
+{
+    if (connection == NULL || buffer == NULL || buffer_size < sizeof(proto_player_data_blob_t))
+    {
+        return false;
+    }
+
+    proto_player_data_blob_t blob;
+    memcpy(&blob, buffer, sizeof(blob));
+
+    connection->pos_x = blob.pos_x;
+    connection->pos_y = blob.pos_y;
+    connection->pos_z = blob.pos_z;
+    connection->yaw = blob.yaw;
+    connection->pitch = blob.pitch;
+    connection->health = blob.health;
+    connection->food_level = blob.food_level;
+    connection->food_saturation = blob.food_saturation;
+    
+    memcpy(connection->inventory_item_ids, blob.inventory_item_ids, sizeof(connection->inventory_item_ids));
+    memcpy(connection->inventory_item_counts, blob.inventory_item_counts, sizeof(connection->inventory_item_counts));
+    connection->selected_hotbar_slot = blob.selected_hotbar_slot;
+    connection->cursor_item_id = blob.cursor_item_id;
+    connection->cursor_item_count = blob.cursor_item_count;
+
+    return true;
+}
+
+static bool load_player_data_from_nvs(proto_connection_t *connection)
+{
+    if (connection == NULL || connection->username[0] == '\0')
+    {
+        return false;
+    }
+
+    char key[16];
+    if (!player_data_nvs_key_for_username(connection->username, key, sizeof(key)))
+    {
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return false;
+    }
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "player data nvs_open(read) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    uint8_t blob_data[sizeof(proto_player_data_blob_t)];
+    size_t blob_size = sizeof(blob_data);
+    err = nvs_get_blob(handle, key, blob_data, &blob_size);
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return false;
+    }
+
+    if (err != ESP_OK || blob_size != sizeof(proto_player_data_blob_t))
+    {
+        ESP_LOGW(TAG, "player data restore failed for user=%s: %s",
+                 connection->username,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    if (!deserialize_player_data_from_buffer(connection, blob_data, sizeof(blob_data)))
+    {
+        ESP_LOGW(TAG, "player data deserialize failed for user=%s", connection->username);
+        return false;
+    }
+
+    connection->inventory_dirty = false;
+    return true;
+}
+
+bool persist_player_data_to_nvs(const proto_connection_t *connection)
+{
+    if (connection == NULL || connection->username[0] == '\0')
+    {
+        return false;
+    }
+
+    char key[16];
+    if (!player_data_nvs_key_for_username(connection->username, key, sizeof(key)))
+    {
+        return false;
+    }
+
+    uint8_t blob_data[sizeof(proto_player_data_blob_t)];
+    if (!serialize_player_data_to_buffer(connection, blob_data, sizeof(blob_data)))
+    {
+        ESP_LOGW(TAG, "player data serialize failed for user=%s", connection->username);
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "player data nvs_open(write) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_blob(handle, key, blob_data, sizeof(blob_data));
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG,
+                 "player data persist failed for user=%s: %s",
+                 connection->username,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
 static int32_t query_block_state_id(int32_t x, int32_t y, int32_t z)
 {
     uint8_t block_id = query_block_id(x, y, z);
@@ -1035,6 +1240,328 @@ static bool send_inventory_snapshot(int socket_fd,
     }
 
     return send_cursor_update(socket_fd, connection, send_fn, send_context);
+}
+
+static bool write_slot_to_writer(proto_writer_t *writer, uint16_t item_id, uint8_t count)
+{
+    if (count == 0 || item_id == 0)
+    {
+        return proto_write_u8(writer, 0);
+    }
+    return proto_write_u8(writer, 1) &&
+           proto_write_varint(writer, (int32_t)item_id) &&
+           proto_write_u8(writer, count) &&
+           proto_write_u8(writer, 0);
+}
+
+static bool send_open_window_packet(int socket_fd,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_open_window) ||
+        !proto_write_u8(&writer, PROTO_CHEST_WINDOW_ID) ||
+        !proto_write_varint(&writer, PROTO_CHEST_WINDOW_TYPE))
+    {
+        return false;
+    }
+
+    static const char chest_title[] = "{\"text\":\"Chest\"}";
+    if (!proto_write_string(&writer, chest_title))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_window_items_packet(int socket_fd,
+                                      const proto_container_state_t *container,
+                                      const proto_connection_t *connection,
+                                      proto_send_callback_t send_fn,
+                                      void *send_context)
+{
+    if (container == NULL || connection == NULL)
+    {
+        return false;
+    }
+
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_window_items) ||
+        !proto_write_u8(&writer, PROTO_CHEST_WINDOW_ID))
+    {
+        return false;
+    }
+
+    size_t count_pos = writer.length;
+    if (!proto_write_varint(&writer, 0))
+    {
+        return false;
+    }
+
+    size_t slot_count = 0;
+
+    for (uint16_t slot = 0; slot < PROTO_CHEST_SLOTS; slot++)
+    {
+        if (!write_slot_to_writer(&writer, container->item_ids[slot], container->item_counts[slot]))
+        {
+            return false;
+        }
+        slot_count++;
+    }
+
+    for (uint16_t player_slot = 9; player_slot <= 44; player_slot++)
+    {
+        if (!write_slot_to_writer(&writer,
+                                   connection->inventory_item_ids[player_slot],
+                                   connection->inventory_item_counts[player_slot]))
+        {
+            return false;
+        }
+        slot_count++;
+    }
+
+    size_t saved_length = writer.length;
+    writer.length = count_pos;
+    if (!proto_write_varint(&writer, (int32_t)slot_count))
+    {
+        return false;
+    }
+    writer.length = saved_length;
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static void handle_chest_click_window(proto_connection_t *connection,
+                                       int socket_fd,
+                                       uint16_t slot_raw,
+                                       uint8_t button,
+                                       proto_send_callback_t send_fn,
+                                       void *send_context)
+{
+    if (connection->open_container_window_id != PROTO_CHEST_WINDOW_ID)
+    {
+        return;
+    }
+
+    proto_container_state_t *container = proto_container_find(
+        connection->open_container_x,
+        connection->open_container_y,
+        connection->open_container_z);
+
+    if (container == NULL)
+    {
+        return;
+    }
+
+    if (button != 0 && button != 1)
+    {
+        return;
+    }
+
+    int16_t window_slot = (int16_t)slot_raw;
+    bool cursor_changed = false;
+    bool slot_changed = false;
+
+    if (window_slot == -999)
+    {
+        if (button == 0 && connection->cursor_item_count > 0)
+        {
+            connection->cursor_item_id = 0;
+            connection->cursor_item_count = 0;
+            cursor_changed = true;
+        }
+        else if (button == 1 && connection->cursor_item_count > 0)
+        {
+            connection->cursor_item_count--;
+            if (connection->cursor_item_count == 0)
+            {
+                connection->cursor_item_id = 0;
+            }
+            cursor_changed = true;
+        }
+    }
+    else
+    {
+        uint16_t *slot_item_ptr = proto_container_resolve_item_ptr(container,
+                                                                   connection->inventory_item_ids,
+                                                                   window_slot);
+        uint8_t *slot_count_ptr = proto_container_resolve_count_ptr(container,
+                                                                    connection->inventory_item_counts,
+                                                                    window_slot);
+
+        if (slot_item_ptr == NULL || slot_count_ptr == NULL)
+        {
+            return;
+        }
+
+        uint16_t slot_item_id = *slot_item_ptr;
+        uint8_t slot_count = *slot_count_ptr;
+        uint16_t cursor_item_id = connection->cursor_item_id;
+        uint8_t cursor_count = connection->cursor_item_count;
+        bool changed = false;
+
+        if (button == 0)
+        {
+            if (cursor_count == 0)
+            {
+                connection->cursor_item_id = slot_item_id;
+                connection->cursor_item_count = slot_count;
+                *slot_item_ptr = 0;
+                *slot_count_ptr = 0;
+                changed = true;
+                cursor_changed = true;
+            }
+            else if (slot_count == 0)
+            {
+                *slot_item_ptr = cursor_item_id;
+                *slot_count_ptr = cursor_count;
+                connection->cursor_item_id = 0;
+                connection->cursor_item_count = 0;
+                changed = true;
+                cursor_changed = true;
+            }
+            else if (slot_item_id == cursor_item_id && slot_count < PROTO_ITEM_STACK_DEFAULT)
+            {
+                uint8_t room = (uint8_t)(PROTO_ITEM_STACK_DEFAULT - slot_count);
+                uint8_t moved = (cursor_count < room) ? cursor_count : room;
+                *slot_count_ptr = (uint8_t)(slot_count + moved);
+                connection->cursor_item_count = (uint8_t)(cursor_count - moved);
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+                changed = true;
+                cursor_changed = true;
+            }
+            else
+            {
+                *slot_item_ptr = cursor_item_id;
+                *slot_count_ptr = cursor_count;
+                connection->cursor_item_id = slot_item_id;
+                connection->cursor_item_count = slot_count;
+                changed = true;
+                cursor_changed = true;
+            }
+        }
+        else
+        {
+            if (cursor_count == 0)
+            {
+                if (slot_item_id == 0 || slot_count == 0)
+                {
+                    return;
+                }
+                uint8_t half = (uint8_t)((slot_count + 1) / 2);
+                connection->cursor_item_id = slot_item_id;
+                connection->cursor_item_count = half;
+                *slot_count_ptr = (uint8_t)(slot_count - half);
+                if (*slot_count_ptr == 0)
+                {
+                    *slot_item_ptr = 0;
+                }
+                changed = true;
+                cursor_changed = true;
+            }
+            else
+            {
+                if (slot_count == 0)
+                {
+                    *slot_item_ptr = cursor_item_id;
+                    *slot_count_ptr = 1;
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                    changed = true;
+                    cursor_changed = true;
+                }
+                else if (slot_item_id == cursor_item_id && slot_count < PROTO_ITEM_STACK_DEFAULT)
+                {
+                    *slot_count_ptr = (uint8_t)(slot_count + 1);
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                    changed = true;
+                    cursor_changed = true;
+                }
+            }
+        }
+
+        if (changed)
+        {
+            bool is_chest = proto_container_window_slot_is_chest(window_slot);
+            int16_t send_slot = is_chest ? window_slot : (int16_t)window_slot;
+            if (!send_set_slot_packet(socket_fd,
+                                      PROTO_CHEST_WINDOW_ID,
+                                      send_slot,
+                                      *slot_item_ptr,
+                                      *slot_count_ptr,
+                                      send_fn,
+                                      send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+
+            if (!is_chest)
+            {
+                connection->inventory_dirty = true;
+            }
+            slot_changed = true;
+        }
+    }
+
+    if (cursor_changed)
+    {
+        if (!send_cursor_update(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+    }
+
+    if (slot_changed || cursor_changed)
+    {
+        if (connection->inventory_dirty &&
+            persist_player_inventory_to_nvs(connection))
+        {
+            connection->inventory_dirty = false;
+        }
+    }
+}
+
+static void handle_play_close_window(proto_connection_t *connection,
+                                     proto_reader_t *reader,
+                                     int socket_fd,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
+{
+    uint8_t window_id = 0;
+    if (!proto_read_u8(reader, &window_id))
+    {
+        connection->close_requested = true;
+        return;
+    }
+
+    if (window_id == 0 || window_id == PROTO_CHEST_WINDOW_ID)
+    {
+        connection->open_container_window_id = 0;
+        connection->open_container_x = 0;
+        connection->open_container_y = 0;
+        connection->open_container_z = 0;
+    }
+
+    (void)socket_fd;
+    (void)send_fn;
+    (void)send_context;
 }
 
 typedef struct
@@ -2957,6 +3484,7 @@ static void handle_login(proto_connection_t *connection,
     initialize_survival_state(connection, now_ms);
 
     load_player_inventory_from_nvs(connection);
+    load_player_data_from_nvs(connection);
 
     if (!send_play_login(socket_fd, connection, server, send_fn, send_context) ||
         !send_initial_position(socket_fd, connection, send_fn, send_context))
@@ -3490,6 +4018,11 @@ static void handle_play_block_dig(proto_connection_t *connection,
         return;
     }
 
+    if (broken_block == BLOCK_CHEST)
+    {
+        proto_container_free(world_x, world_y, world_z);
+    }
+
     publish_block_change(socket_fd,
                          world_x,
                          world_y,
@@ -3656,7 +4189,18 @@ static void handle_play_click_window(proto_connection_t *connection,
 
     (void)action_number;
 
-    if (window_id != 0 || mode != 0)
+    if (mode != 0)
+    {
+        return;
+    }
+
+    if (window_id == PROTO_CHEST_WINDOW_ID && connection->open_container_window_id == PROTO_CHEST_WINDOW_ID)
+    {
+        handle_chest_click_window(connection, socket_fd, slot_raw, button, send_fn, send_context);
+        return;
+    }
+
+    if (window_id != 0)
     {
         return;
     }
@@ -3883,6 +4427,8 @@ static uint8_t item_id_to_block_id(uint16_t item_id)
         return BLOCK_CRAFTING_TABLE;
     case PROTO_ITEM_FURNACE:
         return BLOCK_FURNACE;
+    case PROTO_ITEM_CHEST:
+        return BLOCK_CHEST;
     default:
         return BLOCK_AIR;
     }
@@ -3923,6 +4469,28 @@ static void handle_play_block_place(proto_connection_t *connection,
     (void)cursor_y;
     (void)cursor_z;
     (void)inside_block;
+
+    uint8_t target_block_id = query_block_id(target_x, target_y, target_z);
+
+    if (target_block_id == BLOCK_CHEST)
+    {
+        if (connection->open_container_window_id == 0)
+        {
+            proto_container_state_t *container = proto_container_find_or_create(target_x, target_y, target_z);
+            if (container != NULL)
+            {
+                if (send_open_window_packet(socket_fd, send_fn, send_context) &&
+                    send_window_items_packet(socket_fd, container, connection, send_fn, send_context))
+                {
+                    connection->open_container_window_id = PROTO_CHEST_WINDOW_ID;
+                    connection->open_container_x = target_x;
+                    connection->open_container_y = target_y;
+                    connection->open_container_z = target_z;
+                }
+            }
+        }
+        return;
+    }
 
     int32_t place_x = target_x;
     int32_t place_y = target_y;
@@ -4057,6 +4625,14 @@ static void handle_play(proto_connection_t *connection,
     else if (packet_id == profile->c2s_play_click_window)
     {
         handle_play_click_window(connection,
+                                 reader,
+                                 socket_fd,
+                                 send_fn,
+                                 send_context);
+    }
+    else if (packet_id == profile->c2s_play_close_window)
+    {
+        handle_play_close_window(connection,
                                  reader,
                                  socket_fd,
                                  send_fn,
@@ -4368,6 +4944,10 @@ void proto_tick_connection(proto_connection_t *connection,
     if (connection->inventory_dirty && persist_player_inventory_to_nvs(connection))
     {
         connection->inventory_dirty = false;
+    }
+
+    if (persist_player_data_to_nvs(connection))
+    {
     }
 }
 

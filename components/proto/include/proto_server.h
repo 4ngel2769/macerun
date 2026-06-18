@@ -74,6 +74,12 @@ typedef struct
     uint16_t cursor_item_id;
     uint8_t cursor_item_count;
     char username[17];
+
+    // Container state
+    uint8_t open_container_window_id;
+    int32_t open_container_x;
+    int32_t open_container_y;
+    int32_t open_container_z;
 } proto_connection_t;
 
 typedef struct
@@ -157,3 +163,5 @@ bool proto_give_item(proto_connection_t *connection,
                      proto_send_callback_t send_fn,
                      void *send_context,
                      uint16_t *granted_amount_out);
+
+bool persist_player_data_to_nvs(const proto_connection_t *connection);
