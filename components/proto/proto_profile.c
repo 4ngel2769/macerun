@@ -26,6 +26,7 @@ static const proto_profile_t PROFILE_754 = {
     .c2s_play_held_item_change = 0x25,
     .c2s_play_click_window = 0x09,
     .c2s_play_close_window = 0x08,
+    .c2s_play_client_status = 0x0B,
 
     .s2c_status_response = 0x00,
     .s2c_status_pong = 0x01,
@@ -55,6 +56,7 @@ static const proto_profile_t PROFILE_754 = {
     .s2c_play_open_window      = 0x2D,
     .s2c_play_window_items     = 0x14,
     .s2c_play_close_window     = 0x12,
+    .s2c_play_respawn          = 0x3D,
 
     .supports_light_trust_edges = true,
 };

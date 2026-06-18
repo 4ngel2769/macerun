@@ -192,6 +192,17 @@ bool persist_player_data_to_nvs(const proto_connection_t *connection);
 static bool serialize_player_data_to_buffer(const proto_connection_t *connection, uint8_t *buffer, size_t buffer_size);
 static bool deserialize_player_data_from_buffer(proto_connection_t *connection, const uint8_t *buffer, size_t buffer_size);
 
+static void handle_player_respawn(proto_connection_t *connection,
+                                  int socket_fd,
+                                  proto_send_callback_t send_fn,
+                                  void *send_context);
+
+static void handle_play_client_status(proto_connection_t *connection,
+                                      proto_reader_t *reader,
+                                      int socket_fd,
+                                      proto_send_callback_t send_fn,
+                                      void *send_context);
+
 static const proto_profile_t *active_profile(void)
 {
     if (s_proto_profile == NULL)
@@ -3021,6 +3032,50 @@ static bool send_update_health_packet(int socket_fd,
     return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
 }
 
+static bool send_respawn_packet(int socket_fd,
+                                const proto_connection_t *connection,
+                                proto_send_callback_t send_fn,
+                                void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_respawn) ||
+        !write_f32_be(&writer, (float)connection->pos_x) ||
+        !write_f32_be(&writer, (float)connection->pos_y) ||
+        !write_f32_be(&writer, (float)connection->pos_z) ||
+        !write_f32_be(&writer, connection->yaw) ||
+        !write_f32_be(&writer, connection->pitch) ||
+        !proto_write_u8(&writer, connection->on_ground ? 1 : 0))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_player_position_look_packet(int socket_fd,
+                                             const proto_connection_t *connection,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_player_position_look) ||
+        !write_f64_be(&writer, connection->pos_x) ||
+        !write_f64_be(&writer, connection->pos_y) ||
+        !write_f64_be(&writer, connection->pos_z) ||
+        !write_f32_be(&writer, connection->yaw) ||
+        !write_f32_be(&writer, connection->pitch) ||
+        !proto_write_u8(&writer, connection->on_ground ? 1 : 0))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
 static bool build_chat_packet_body(const char *message_text,
                                    int64_t uuid_most,
                                    int64_t uuid_least,
@@ -4638,6 +4693,10 @@ static void handle_play(proto_connection_t *connection,
                                  send_fn,
                                  send_context);
     }
+    else if (packet_id == profile->c2s_play_client_status)
+    {
+        handle_play_client_status(connection, reader, socket_fd, send_fn, send_context);
+    }
 }
 
 static bool recover_player_if_out_of_world(proto_connection_t *connection,
@@ -4739,6 +4798,25 @@ static void tick_survival_state(proto_connection_t *connection,
         }
         connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
         health_changed = true;
+    }
+
+    if (connection->health <= 0.0f && now_ms >= connection->next_void_damage_ms)
+    {
+        connection->health = 0.0f;
+        health_changed = true;
+
+        ESP_LOGW(TAG,
+                 "player died: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
+
+        if (!send_update_health_packet(socket_fd, connection, send_fn, send_context))
+        {
+            ESP_LOGW(TAG,
+                     "death health update send failed: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
+        }
+
+        connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
     }
 
     if (!health_changed)
@@ -5011,6 +5089,22 @@ bool proto_send_health_update(int socket_fd,
     return send_update_health_packet(socket_fd, player, send_fn, send_context);
 }
 
+bool proto_send_respawn_packet(int socket_fd,
+                               const proto_connection_t *connection,
+                               proto_send_callback_t send_fn,
+                               void *send_context)
+{
+    return send_respawn_packet(socket_fd, connection, send_fn, send_context);
+}
+
+bool proto_send_player_position_look_packet(int socket_fd,
+                                             const proto_connection_t *connection,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
+{
+    return send_player_position_look_packet(socket_fd, connection, send_fn, send_context);
+}
+
 static bool item_name_equals(const char *value, const char *expected)
 {
     if (value == NULL || expected == NULL)
@@ -5127,6 +5221,86 @@ bool proto_give_item(proto_connection_t *connection,
     }
 
     return total_granted == amount;
+}
+
+static void handle_player_respawn(proto_connection_t *connection,
+                                   int socket_fd,
+                                   proto_send_callback_t send_fn,
+                                   void *send_context)
+{
+    ensure_world_initialized();
+
+    connection->health = 20.0f;
+    connection->health_dirty = true;
+    connection->food_level = 20;
+    connection->next_hunger_decay_ms = 0;
+    connection->next_health_regen_ms = 0;
+    connection->next_starvation_damage_ms = 0;
+    connection->next_void_damage_ms = 0;
+
+    double spawn_x = 0.0;
+    double spawn_y = (double)s_world_config.sea_level + 1.0;
+    double spawn_z = 0.0;
+
+    connection->pos_x = spawn_x;
+    connection->pos_y = spawn_y;
+    connection->pos_z = spawn_z;
+    connection->prev_pos_x = spawn_x;
+    connection->prev_pos_y = spawn_y;
+    connection->prev_pos_z = spawn_z;
+    connection->on_ground = true;
+
+    reset_chunk_stream_state(connection);
+
+    send_respawn_packet(socket_fd, connection, send_fn, send_context);
+    send_player_position_look_packet(socket_fd, connection, send_fn, send_context);
+
+    ESP_LOGI(TAG,
+             "player respawn: user=%s to position=(%.2f,%.2f,%.2f)",
+             connection->username[0] != '\0' ? connection->username : "(unknown)",
+             spawn_x,
+             spawn_y,
+             spawn_z);
+}
+
+void proto_handle_player_death(proto_connection_t *connection,
+                                int socket_fd,
+                                proto_send_callback_t send_fn,
+                                void *send_context)
+{
+    if (connection->health <= 0.0f)
+    {
+        ESP_LOGW(TAG,
+                 "player died: user=%s",
+                 connection->username[0] != '\0' ? connection->username : "(unknown)");
+
+        if (!send_update_health_packet(socket_fd, connection, send_fn, send_context))
+        {
+            ESP_LOGW(TAG,
+                     "death health update send failed: user=%s",
+                     connection->username[0] != '\0' ? connection->username : "(unknown)");
+        }
+
+        connection->next_void_damage_ms = connection->next_hunger_decay_ms;
+    }
+}
+
+static void handle_play_client_status(proto_connection_t *connection,
+                                      proto_reader_t *reader,
+                                      int socket_fd,
+                                      proto_send_callback_t send_fn,
+                                      void *send_context)
+{
+    int32_t action_id = 0;
+    if (!proto_read_varint(reader, &action_id))
+    {
+        return;
+    }
+
+    if (action_id == 0)
+    {
+        handle_player_respawn(connection, socket_fd, send_fn, send_context);
+    }
 }
 
 void proto_server_save_world(void)

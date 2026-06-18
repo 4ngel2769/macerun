@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "server_limits.h"
+#include "proto_framing.h"
 
 typedef struct
 {
@@ -129,9 +130,9 @@ bool proto_build_chat_packet(const char *message_text,
                              size_t *framed_packet_length);
 
 bool proto_send_player_presence(int socket_fd,
-                                const proto_connection_t *player,
-                                proto_send_callback_t send_fn,
-                                void *send_context);
+                                 const proto_connection_t *player,
+                                 proto_send_callback_t send_fn,
+                                 void *send_context);
 
 bool proto_send_player_remove(int socket_fd,
                               const proto_connection_t *player,
@@ -154,6 +155,16 @@ bool proto_send_health_update(int socket_fd,
                               proto_send_callback_t send_fn,
                               void *send_context);
 
+bool proto_send_respawn_packet(int socket_fd,
+                               const proto_connection_t *connection,
+                               proto_send_callback_t send_fn,
+                               void *send_context);
+
+bool proto_send_player_position_look_packet(int socket_fd,
+                                             const proto_connection_t *connection,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context);
+
 bool proto_resolve_item_name(const char *item_name, uint16_t *item_id_out);
 
 bool proto_give_item(proto_connection_t *connection,
@@ -163,5 +174,21 @@ bool proto_give_item(proto_connection_t *connection,
                      proto_send_callback_t send_fn,
                      void *send_context,
                      uint16_t *granted_amount_out);
+
+void proto_handle_player_respawn(proto_connection_t *connection,
+                                 int socket_fd,
+                                 proto_send_callback_t send_fn,
+                                 void *send_context);
+
+void proto_handle_player_death(proto_connection_t *connection,
+                                int socket_fd,
+                                proto_send_callback_t send_fn,
+                                void *send_context);
+
+void proto_handle_client_status(proto_connection_t *connection,
+                                proto_reader_t *reader,
+                                int socket_fd,
+                                proto_send_callback_t send_fn,
+                                void *send_context);
 
 bool persist_player_data_to_nvs(const proto_connection_t *connection);
