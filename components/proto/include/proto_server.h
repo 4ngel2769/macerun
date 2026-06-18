@@ -7,6 +7,7 @@
 #include "server_limits.h"
 #include "proto_framing.h"
 #include "proto_entity.h"
+#include "proto_crafting.h"
 
 typedef struct
 {
@@ -82,6 +83,10 @@ typedef struct
     int32_t open_container_x;
     int32_t open_container_y;
     int32_t open_container_z;
+
+    // Crafting table grid (3x3, for window_id=2)
+    uint16_t crafting_grid_item_ids[9];
+    uint8_t crafting_grid_item_counts[9];
 } proto_connection_t;
 
 typedef struct

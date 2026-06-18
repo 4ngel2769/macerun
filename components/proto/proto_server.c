@@ -70,33 +70,6 @@ typedef enum
 #define PROTO_INVENTORY_SLOT_HOTBAR_FIRST 36
 #define PROTO_INVENTORY_SLOT_HOTBAR_LAST 44
 #define PROTO_ITEM_STACK_DEFAULT 64
-#define PROTO_ITEM_OAK_PLANKS 15
-#define PROTO_ITEM_SPRUCE_PLANKS 16
-#define PROTO_ITEM_BIRCH_PLANKS 17
-#define PROTO_ITEM_JUNGLE_PLANKS 18
-#define PROTO_ITEM_ACACIA_PLANKS 19
-#define PROTO_ITEM_DARK_OAK_PLANKS 20
-#define PROTO_ITEM_CRIMSON_PLANKS 21
-#define PROTO_ITEM_WARPED_PLANKS 22
-#define PROTO_ITEM_STICK 613
-#define PROTO_ITEM_DIRT 9
-#define PROTO_ITEM_COBBLESTONE 14
-#define PROTO_ITEM_SAND 30
-#define PROTO_ITEM_OAK_LOG 37
-#define PROTO_ITEM_OAK_WOOD 61
-#define PROTO_ITEM_STRIPPED_OAK_LOG 45
-#define PROTO_ITEM_STRIPPED_OAK_WOOD 53
-#define PROTO_ITEM_SPRUCE_LOG 38
-#define PROTO_ITEM_SPRUCE_WOOD 62
-#define PROTO_ITEM_STRIPPED_SPRUCE_LOG 46
-#define PROTO_ITEM_STRIPPED_SPRUCE_WOOD 54
-#define PROTO_ITEM_BAMBOO 135
-#define PROTO_ITEM_OAK_LEAVES 69
-#define PROTO_ITEM_CRAFTING_TABLE 183
-#define PROTO_ITEM_FURNACE 185
-#define PROTO_ITEM_DIAMOND 578
-#define PROTO_ITEM_SNOWBALL 666
-#define PROTO_ITEM_CHEST 485
 
 typedef struct
 {
@@ -131,6 +104,29 @@ static const proto_item_name_entry_t s_item_name_entries[] = {
     {"furnace", PROTO_ITEM_FURNACE},
     {"diamond", PROTO_ITEM_DIAMOND},
     {"snowball", PROTO_ITEM_SNOWBALL},
+    {"wooden_sword", PROTO_ITEM_WOODEN_SWORD},
+    {"wooden_shovel", PROTO_ITEM_WOODEN_SPADE},
+    {"wooden_pickaxe", PROTO_ITEM_WOODEN_PICKAXE},
+    {"wooden_axe", PROTO_ITEM_WOODEN_AXE},
+    {"wooden_hoe", PROTO_ITEM_WOODEN_HOE},
+    {"stone_sword", PROTO_ITEM_STONE_SWORD},
+    {"stone_shovel", PROTO_ITEM_STONE_SPADE},
+    {"stone_pickaxe", PROTO_ITEM_STONE_PICKAXE},
+    {"stone_axe", PROTO_ITEM_STONE_AXE},
+    {"stone_hoe", PROTO_ITEM_STONE_HOE},
+    {"iron_sword", PROTO_ITEM_IRON_SWORD},
+    {"iron_shovel", PROTO_ITEM_IRON_SPADE},
+    {"iron_pickaxe", PROTO_ITEM_IRON_PICKAXE},
+    {"iron_axe", PROTO_ITEM_IRON_AXE},
+    {"iron_hoe", PROTO_ITEM_IRON_HOE},
+    {"diamond_sword", PROTO_ITEM_DIAMOND_SWORD},
+    {"diamond_shovel", PROTO_ITEM_DIAMOND_SPADE},
+    {"diamond_pickaxe", PROTO_ITEM_DIAMOND_PICKAXE},
+    {"diamond_axe", PROTO_ITEM_DIAMOND_AXE},
+    {"diamond_hoe", PROTO_ITEM_DIAMOND_HOE},
+    {"iron_ingot", PROTO_ITEM_IRON_INGOT},
+    {"gold_ingot", PROTO_ITEM_GOLD_INGOT},
+    {"coal", PROTO_ITEM_COAL},
 };
 
 #define PROTO_ITEM_NAME_ENTRY_COUNT ((size_t)(sizeof(s_item_name_entries) / sizeof(s_item_name_entries[0])))
@@ -1572,6 +1568,469 @@ static void handle_chest_click_window(proto_connection_t *connection,
     }
 }
 
+static bool send_crafting_table_open_packet(int socket_fd,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_open_window) ||
+        !proto_write_u8(&writer, PROTO_CRAFTING_TABLE_WINDOW_ID) ||
+        !proto_write_varint(&writer, PROTO_CRAFTING_TABLE_WINDOW_TYPE))
+    {
+        return false;
+    }
+
+    static const char title[] = "{\"text\":\"Crafting Table\"}";
+    if (!proto_write_string(&writer, title))
+    {
+        return false;
+    }
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool send_crafting_table_window_items(int socket_fd,
+                                              const proto_connection_t *connection,
+                                              proto_send_callback_t send_fn,
+                                              void *send_context)
+{
+    proto_writer_t writer;
+    proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
+
+    if (!proto_write_varint(&writer, active_profile()->s2c_play_window_items) ||
+        !proto_write_u8(&writer, PROTO_CRAFTING_TABLE_WINDOW_ID))
+    {
+        return false;
+    }
+
+    size_t count_pos = writer.length;
+    if (!proto_write_varint(&writer, 0))
+    {
+        return false;
+    }
+
+    size_t slot_count = 0;
+
+    // Slot 0: crafting output (evaluate recipe)
+    proto_table_crafting_match_t match = proto_evaluate_table_crafting(connection->crafting_grid_item_ids);
+    if (!write_slot_to_writer(&writer, match.item_id, match.count))
+    {
+        return false;
+    }
+    slot_count++;
+
+    // Slots 1-9: crafting grid
+    for (uint8_t i = 0; i < 9; i++)
+    {
+        if (!write_slot_to_writer(&writer,
+                                   connection->crafting_grid_item_ids[i],
+                                   connection->crafting_grid_item_counts[i]))
+        {
+            return false;
+        }
+        slot_count++;
+    }
+
+    // Slots 10-45: player inventory (slot 9-44)
+    for (uint16_t player_slot = 9; player_slot <= 44; player_slot++)
+    {
+        if (!write_slot_to_writer(&writer,
+                                   connection->inventory_item_ids[player_slot],
+                                   connection->inventory_item_counts[player_slot]))
+        {
+            return false;
+        }
+        slot_count++;
+    }
+
+    size_t saved_length = writer.length;
+    writer.length = count_pos;
+    if (!proto_write_varint(&writer, (int32_t)slot_count))
+    {
+        return false;
+    }
+    writer.length = saved_length;
+
+    return send_packet(socket_fd, s_proto_packet_buffer, writer.length, send_fn, send_context);
+}
+
+static bool sync_crafting_table_output_slot(int socket_fd,
+                                             const proto_connection_t *connection,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
+{
+    proto_table_crafting_match_t match = proto_evaluate_table_crafting(connection->crafting_grid_item_ids);
+    return send_set_slot_packet(socket_fd,
+                                PROTO_CRAFTING_TABLE_WINDOW_ID,
+                                0,
+                                match.item_id,
+                                match.count,
+                                send_fn,
+                                send_context);
+}
+
+static bool sync_crafting_table_grid_slot(int socket_fd,
+                                           const proto_connection_t *connection,
+                                           uint8_t grid_index,
+                                           proto_send_callback_t send_fn,
+                                           void *send_context)
+{
+    return send_set_slot_packet(socket_fd,
+                                PROTO_CRAFTING_TABLE_WINDOW_ID,
+                                (int16_t)(1 + grid_index),
+                                connection->crafting_grid_item_ids[grid_index],
+                                connection->crafting_grid_item_counts[grid_index],
+                                send_fn,
+                                send_context);
+}
+
+static void handle_crafting_table_click(proto_connection_t *connection,
+                                         int socket_fd,
+                                         uint16_t slot_raw,
+                                         uint8_t button,
+                                         proto_send_callback_t send_fn,
+                                         void *send_context)
+{
+    if (connection->open_container_window_id != PROTO_CRAFTING_TABLE_WINDOW_ID)
+    {
+        return;
+    }
+
+    if (button != 0 && button != 1)
+    {
+        return;
+    }
+
+    int16_t window_slot = (int16_t)slot_raw;
+
+    if (window_slot == -999)
+    {
+        if (connection->cursor_item_count > 0)
+        {
+            if (button == 0)
+            {
+                connection->cursor_item_id = 0;
+                connection->cursor_item_count = 0;
+            }
+            else
+            {
+                connection->cursor_item_count--;
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+            }
+            send_cursor_update(socket_fd, connection, send_fn, send_context);
+        }
+        return;
+    }
+
+    // Grid slots (1-9)
+    if (window_slot >= 1 && window_slot <= 9)
+    {
+        uint8_t grid_index = (uint8_t)(window_slot - 1);
+        uint16_t *grid_id = &connection->crafting_grid_item_ids[grid_index];
+        uint8_t *grid_count = &connection->crafting_grid_item_counts[grid_index];
+
+        if (button == 0)
+        {
+            if (connection->cursor_item_count == 0 && *grid_count == 0)
+            {
+                return;
+            }
+
+            if (connection->cursor_item_count == 0)
+            {
+                connection->cursor_item_id = *grid_id;
+                connection->cursor_item_count = *grid_count;
+                *grid_id = 0;
+                *grid_count = 0;
+            }
+            else if (*grid_count == 0)
+            {
+                *grid_id = connection->cursor_item_id;
+                *grid_count = connection->cursor_item_count;
+                connection->cursor_item_id = 0;
+                connection->cursor_item_count = 0;
+            }
+            else if (*grid_id == connection->cursor_item_id &&
+                     *grid_count < PROTO_ITEM_STACK_DEFAULT)
+            {
+                uint8_t room = (uint8_t)(PROTO_ITEM_STACK_DEFAULT - *grid_count);
+                uint8_t moved = (connection->cursor_item_count < room) ? connection->cursor_item_count : room;
+                *grid_count = (uint8_t)(*grid_count + moved);
+                connection->cursor_item_count = (uint8_t)(connection->cursor_item_count - moved);
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+            }
+            else
+            {
+                uint16_t tmp_id = *grid_id;
+                uint8_t tmp_count = *grid_count;
+                *grid_id = connection->cursor_item_id;
+                *grid_count = connection->cursor_item_count;
+                connection->cursor_item_id = tmp_id;
+                connection->cursor_item_count = tmp_count;
+            }
+        }
+        else
+        {
+            if (connection->cursor_item_count == 0)
+            {
+                if (*grid_id == 0 || *grid_count == 0)
+                {
+                    return;
+                }
+
+                uint8_t half = (uint8_t)((*grid_count + 1) / 2);
+                connection->cursor_item_id = *grid_id;
+                connection->cursor_item_count = half;
+                *grid_count = (uint8_t)(*grid_count - half);
+                if (*grid_count == 0)
+                {
+                    *grid_id = 0;
+                }
+            }
+            else
+            {
+                if (*grid_count == 0)
+                {
+                    *grid_id = connection->cursor_item_id;
+                    *grid_count = 1;
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                }
+                else if (*grid_id == connection->cursor_item_id &&
+                         *grid_count < PROTO_ITEM_STACK_DEFAULT)
+                {
+                    *grid_count = (uint8_t)(*grid_count + 1);
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                }
+                else
+                {
+                    return;
+                }
+            }
+        }
+
+        if (!sync_crafting_table_grid_slot(socket_fd, connection, grid_index, send_fn, send_context) ||
+            !send_cursor_update(socket_fd, connection, send_fn, send_context) ||
+            !sync_crafting_table_output_slot(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+        }
+        return;
+    }
+
+    // Output slot (0)
+    if (window_slot == 0)
+    {
+        if (button != 0)
+        {
+            return;
+        }
+
+        proto_table_crafting_match_t match = proto_evaluate_table_crafting(connection->crafting_grid_item_ids);
+        if (match.count == 0)
+        {
+            return;
+        }
+
+        if (connection->cursor_item_count > 0 &&
+            (connection->cursor_item_id != match.item_id ||
+             connection->cursor_item_count > (PROTO_ITEM_STACK_DEFAULT - match.count)))
+        {
+            return;
+        }
+
+        if (connection->cursor_item_count == 0)
+        {
+            connection->cursor_item_id = match.item_id;
+            connection->cursor_item_count = match.count;
+        }
+        else
+        {
+            connection->cursor_item_count = (uint8_t)(connection->cursor_item_count + match.count);
+        }
+
+        proto_consume_table_ingredients(connection->crafting_grid_item_ids,
+                                         connection->crafting_grid_item_counts,
+                                         match.consume_mask);
+
+        if (!send_cursor_update(socket_fd, connection, send_fn, send_context) ||
+            !sync_crafting_table_output_slot(socket_fd, connection, send_fn, send_context))
+        {
+            connection->close_requested = true;
+            return;
+        }
+
+        // Sync all grid slots after consumption
+        for (uint8_t i = 0; i < 9; i++)
+        {
+            if (!sync_crafting_table_grid_slot(socket_fd, connection, i, send_fn, send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+        }
+
+        return;
+    }
+
+    // Player inventory slots (10-45)
+    if (window_slot >= 10 && window_slot <= 45)
+    {
+        int16_t player_slot = (int16_t)(window_slot - 1);
+        uint16_t *slot_id = &connection->inventory_item_ids[player_slot];
+        uint8_t *slot_count = &connection->inventory_item_counts[player_slot];
+        bool changed = false;
+        bool cursor_changed = false;
+
+        if (button == 0)
+        {
+            if (connection->cursor_item_count == 0 && *slot_count == 0)
+            {
+                return;
+            }
+
+            if (connection->cursor_item_count == 0)
+            {
+                connection->cursor_item_id = *slot_id;
+                connection->cursor_item_count = *slot_count;
+                *slot_id = 0;
+                *slot_count = 0;
+                changed = true;
+                cursor_changed = true;
+            }
+            else if (*slot_count == 0)
+            {
+                *slot_id = connection->cursor_item_id;
+                *slot_count = connection->cursor_item_count;
+                connection->cursor_item_id = 0;
+                connection->cursor_item_count = 0;
+                changed = true;
+                cursor_changed = true;
+            }
+            else if (*slot_id == connection->cursor_item_id && *slot_count < PROTO_ITEM_STACK_DEFAULT)
+            {
+                uint8_t room = (uint8_t)(PROTO_ITEM_STACK_DEFAULT - *slot_count);
+                uint8_t moved = (connection->cursor_item_count < room) ? connection->cursor_item_count : room;
+                *slot_count = (uint8_t)(*slot_count + moved);
+                connection->cursor_item_count = (uint8_t)(connection->cursor_item_count - moved);
+                if (connection->cursor_item_count == 0)
+                {
+                    connection->cursor_item_id = 0;
+                }
+                changed = true;
+                cursor_changed = true;
+            }
+            else
+            {
+                uint16_t tmp_id = *slot_id;
+                uint8_t tmp_count = *slot_count;
+                *slot_id = connection->cursor_item_id;
+                *slot_count = connection->cursor_item_count;
+                connection->cursor_item_id = tmp_id;
+                connection->cursor_item_count = tmp_count;
+                changed = true;
+                cursor_changed = true;
+            }
+        }
+        else
+        {
+            if (connection->cursor_item_count == 0)
+            {
+                if (*slot_id == 0 || *slot_count == 0)
+                {
+                    return;
+                }
+                uint8_t half = (uint8_t)((*slot_count + 1) / 2);
+                connection->cursor_item_id = *slot_id;
+                connection->cursor_item_count = half;
+                *slot_count = (uint8_t)(*slot_count - half);
+                if (*slot_count == 0)
+                {
+                    *slot_id = 0;
+                }
+                changed = true;
+                cursor_changed = true;
+            }
+            else
+            {
+                if (*slot_count == 0)
+                {
+                    *slot_id = connection->cursor_item_id;
+                    *slot_count = 1;
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                    changed = true;
+                    cursor_changed = true;
+                }
+                else if (*slot_id == connection->cursor_item_id && *slot_count < PROTO_ITEM_STACK_DEFAULT)
+                {
+                    *slot_count = (uint8_t)(*slot_count + 1);
+                    connection->cursor_item_count--;
+                    if (connection->cursor_item_count == 0)
+                    {
+                        connection->cursor_item_id = 0;
+                    }
+                    changed = true;
+                    cursor_changed = true;
+                }
+            }
+        }
+
+        if (changed)
+        {
+            if (!send_set_slot_packet(socket_fd,
+                                       PROTO_CRAFTING_TABLE_WINDOW_ID,
+                                       window_slot,
+                                       *slot_id,
+                                       *slot_count,
+                                       send_fn,
+                                       send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+            connection->inventory_dirty = true;
+        }
+
+        if (cursor_changed)
+        {
+            if (!send_cursor_update(socket_fd, connection, send_fn, send_context))
+            {
+                connection->close_requested = true;
+                return;
+            }
+        }
+
+        if (changed || cursor_changed)
+        {
+            if (connection->inventory_dirty &&
+                persist_player_inventory_to_nvs(connection))
+            {
+                connection->inventory_dirty = false;
+            }
+        }
+        return;
+    }
+}
+
 static void handle_play_close_window(proto_connection_t *connection,
                                      proto_reader_t *reader,
                                      int socket_fd,
@@ -1585,7 +2044,7 @@ static void handle_play_close_window(proto_connection_t *connection,
         return;
     }
 
-    if (window_id == 0 || window_id == PROTO_CHEST_WINDOW_ID)
+    if (window_id == 0 || window_id == PROTO_CHEST_WINDOW_ID || window_id == PROTO_CRAFTING_TABLE_WINDOW_ID)
     {
         connection->open_container_window_id = 0;
         connection->open_container_x = 0;
@@ -1674,24 +2133,6 @@ static uint16_t player_crafting_grid_item(const proto_connection_t *connection, 
     }
 
     return connection->inventory_item_ids[slot];
-}
-
-static bool is_plank_item(uint16_t item_id)
-{
-    switch (item_id)
-    {
-    case PROTO_ITEM_OAK_PLANKS:
-    case PROTO_ITEM_SPRUCE_PLANKS:
-    case PROTO_ITEM_BIRCH_PLANKS:
-    case PROTO_ITEM_JUNGLE_PLANKS:
-    case PROTO_ITEM_ACACIA_PLANKS:
-    case PROTO_ITEM_DARK_OAK_PLANKS:
-    case PROTO_ITEM_CRIMSON_PLANKS:
-    case PROTO_ITEM_WARPED_PLANKS:
-        return true;
-    default:
-        return false;
-    }
 }
 
 static bool match_player_shaped_recipe(const proto_connection_t *connection,
@@ -1828,8 +2269,8 @@ static proto_player_crafting_match_t evaluate_player_crafting_match(const proto_
     uint16_t bottom_right = player_crafting_grid_item(connection, 3);
 
     if (top_left != 0 && top_right != 0 && bottom_left != 0 && bottom_right != 0 &&
-        is_plank_item(top_left) && is_plank_item(top_right) &&
-        is_plank_item(bottom_left) && is_plank_item(bottom_right))
+        proto_is_plank_item(top_left) && proto_is_plank_item(top_right) &&
+        proto_is_plank_item(bottom_left) && proto_is_plank_item(bottom_right))
     {
         match.output.item_id = PROTO_ITEM_CRAFTING_TABLE;
         match.output.count = 1;
@@ -1845,7 +2286,7 @@ static proto_player_crafting_match_t evaluate_player_crafting_match(const proto_
         uint16_t top = left_column_only ? top_left : top_right;
         uint16_t bottom = left_column_only ? bottom_left : bottom_right;
 
-        bool plank_stick = is_plank_item(top) && is_plank_item(bottom);
+        bool plank_stick = proto_is_plank_item(top) && proto_is_plank_item(bottom);
         bool bamboo_stick = top == PROTO_ITEM_BAMBOO && bottom == PROTO_ITEM_BAMBOO;
 
         if (plank_stick || bamboo_stick)
@@ -4278,6 +4719,13 @@ static void handle_play_click_window(proto_connection_t *connection,
         return;
     }
 
+    if (window_id == PROTO_CRAFTING_TABLE_WINDOW_ID &&
+        connection->open_container_window_id == PROTO_CRAFTING_TABLE_WINDOW_ID)
+    {
+        handle_crafting_table_click(connection, socket_fd, slot_raw, button, send_fn, send_context);
+        return;
+    }
+
     if (window_id != 0)
     {
         return;
@@ -4565,6 +5013,22 @@ static void handle_play_block_place(proto_connection_t *connection,
                     connection->open_container_y = target_y;
                     connection->open_container_z = target_z;
                 }
+            }
+        }
+        return;
+    }
+
+    if (target_block_id == BLOCK_CRAFTING_TABLE)
+    {
+        if (connection->open_container_window_id == 0)
+        {
+            if (send_crafting_table_open_packet(socket_fd, send_fn, send_context) &&
+                send_crafting_table_window_items(socket_fd, connection, send_fn, send_context))
+            {
+                connection->open_container_window_id = PROTO_CRAFTING_TABLE_WINDOW_ID;
+                connection->open_container_x = target_x;
+                connection->open_container_y = target_y;
+                connection->open_container_z = target_z;
             }
         }
         return;
