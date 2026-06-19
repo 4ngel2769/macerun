@@ -2850,7 +2850,7 @@ static bool send_map_chunk_packet(int socket_fd,
 
     for (int32_t i = 0; i < 1024; i++)
     {
-        if (!proto_write_varint(&writer, 0))
+        if (!write_i32_be(&writer, 0))
         {
             ESP_LOGW(TAG,
                      "chunk biome write failed at (%ld,%ld): i=%d",
@@ -3013,7 +3013,6 @@ static bool write_dimension_codec_nbt(proto_writer_t *writer)
            nbt_write_named_string(writer, "type", "minecraft:worldgen/biome") &&
            nbt_begin_named_list(writer, "value", NBT_TAG_COMPOUND, 1) &&
            write_plains_biome_registry_entry(writer) &&
-           nbt_end_compound(writer) &&
            nbt_end_compound(writer) &&
            nbt_end_compound(writer);
 }
