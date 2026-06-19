@@ -35,7 +35,7 @@ idf.py flash monitor
 ## Todo
 
 - [x] Player Persistence: Saving player data upon disconnecting (coordinates, health, hunger, and inventory items).
-- [ ] Advanced Crafting: 3x3 crafting grid support.
+- [x] Advanced Crafting: 3x3 crafting grid support.
 - [x] Containers: Chests and block inventory management.
 - [x] Entities: Mobs, spawning, mob AI, and combat (player ↔ mob damage).
 - [x] Respawning: Handling player death and the respawn.

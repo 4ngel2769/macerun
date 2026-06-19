@@ -912,6 +912,8 @@ static void server_task(void *arg)
 
     ESP_LOGI(TAG, "listening on port %u", (unsigned int)server->config.bind_port);
 
+    proto_entity_init();
+
     while (server->running)
     {
         uint64_t now_ms = server->uptime_ms;
