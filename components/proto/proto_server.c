@@ -2910,7 +2910,9 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, sky_light_mask) ||
         !proto_write_varint(&writer, block_light_mask) ||
         !proto_write_varint(&writer, empty_sky_light_mask) ||
-        !proto_write_varint(&writer, empty_block_light_mask))
+        !proto_write_varint(&writer, empty_block_light_mask) ||
+        !proto_write_varint(&writer, 0) ||
+        !proto_write_varint(&writer, 0))
     {
         ESP_LOGW(TAG,
                  "light packet write failed at (%ld,%ld)",
