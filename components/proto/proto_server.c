@@ -2839,7 +2839,7 @@ static bool send_map_chunk_packet(int socket_fd,
         !proto_write_u8(&writer, 1) ||
         !proto_write_varint(&writer, section_mask) ||
         !write_chunk_heightmaps_nbt(&writer, height_samples) ||
-        !proto_write_varint(&writer, PROTO_BIOME_ARRAY_COUNT))
+        !proto_write_varint(&writer, 1024))
     {
         ESP_LOGW(TAG,
                  "chunk header write failed at (%ld,%ld)",
@@ -2848,15 +2848,15 @@ static bool send_map_chunk_packet(int socket_fd,
         return false;
     }
 
-    for (int32_t i = 0; i < PROTO_BIOME_ARRAY_COUNT; i++)
+    for (int32_t i = 0; i < 1024; i++)
     {
-        if (!proto_write_varint(&writer, 1))
+        if (!proto_write_varint(&writer, 0))
         {
             ESP_LOGW(TAG,
-                     "chunk biome write failed at (%ld,%ld): index=%ld",
+                     "chunk biome write failed at (%ld,%ld): i=%d",
                      (long)chunk_x,
                      (long)chunk_z,
-                     (long)i);
+                     i);
             return false;
         }
     }
@@ -2910,9 +2910,7 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, sky_light_mask) ||
         !proto_write_varint(&writer, block_light_mask) ||
         !proto_write_varint(&writer, empty_sky_light_mask) ||
-        !proto_write_varint(&writer, empty_block_light_mask) ||
-        !proto_write_varint(&writer, 0) ||
-        !proto_write_varint(&writer, 0))
+        !proto_write_varint(&writer, empty_block_light_mask))
     {
         ESP_LOGW(TAG,
                  "light packet write failed at (%ld,%ld)",
@@ -3015,6 +3013,7 @@ static bool write_dimension_codec_nbt(proto_writer_t *writer)
            nbt_write_named_string(writer, "type", "minecraft:worldgen/biome") &&
            nbt_begin_named_list(writer, "value", NBT_TAG_COMPOUND, 1) &&
            write_plains_biome_registry_entry(writer) &&
+           nbt_end_compound(writer) &&
            nbt_end_compound(writer) &&
            nbt_end_compound(writer);
 }
@@ -3419,7 +3418,7 @@ static bool send_play_login(int socket_fd,
         !write_i32_be(&writer, connection->entity_id) ||
         !proto_write_u8(&writer, 0) ||
         !proto_write_u8(&writer, 0) ||
-        !proto_write_u8(&writer, 0xFF) ||
+        !proto_write_u8(&writer, 0) ||
         !proto_write_varint(&writer, 1) ||
         !proto_write_string(&writer, "minecraft:overworld") ||
         !write_dimension_codec_nbt(&writer) ||

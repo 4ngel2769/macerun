@@ -23,6 +23,7 @@ static int64_t s_next_uuid_least = 0x0000000000000001LL;
 static proto_mob_t s_mobs[PROTO_MAX_MOBS];
 
 static uint64_t s_last_spawn_attempt_ms = 0;
+static bool s_entity_initialized = false;
 
 static uint8_t s_proto_entity_buffer[512];
 
@@ -123,6 +124,7 @@ void proto_entity_init(void)
     world_config_set_defaults(&s_world_config, WORLD_SEED_DEFAULT);
     s_profile = proto_profile_default();
     s_last_spawn_attempt_ms = 0;
+    s_entity_initialized = true;
 }
 
 int32_t proto_entity_spawn_mob(uint8_t entity_type,
@@ -567,6 +569,11 @@ void proto_entity_tick(uint64_t now_ms,
                         int player_count,
                         proto_entity_damage_fn damage_fn)
 {
+    if (!s_entity_initialized)
+    {
+        return;
+    }
+
     try_spawn_mob(now_ms, players, player_count);
 
     for (size_t i = 0; i < PROTO_MAX_MOBS; i++)
