@@ -112,7 +112,7 @@ static anchor_cache_entry_t s_anchor_cache[ANCHOR_CACHE_SIZE];
 
 static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, int32_t az)
 {
-    uint32_t cache_idx = ((uint32_t)(ax * 73856093) ^ (uint32_t)(az * 19349663)) & (ANCHOR_CACHE_SIZE - 1);
+    uint32_t cache_idx = (((uint32_t)ax * 73856093u) ^ ((uint32_t)az * 19349663u)) & (ANCHOR_CACHE_SIZE - 1);
     anchor_cache_entry_t *entry = &s_anchor_cache[cache_idx];
     
     if (entry->valid && entry->seed == config->seed && entry->ax == ax && entry->az == az)
@@ -184,12 +184,14 @@ static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, in
     }
 
     int16_t final_height = clamp_i16(height, config->min_y + 1, config->max_y);
-    
-    entry->valid = true;
+
+    /* Publish payload first and flip `valid` last so a reader that races with
+     * a refilled slot never observes valid=true with stale coordinates. */
     entry->seed = config->seed;
     entry->ax = ax;
     entry->az = az;
     entry->height = final_height;
+    entry->valid = true;
 
     return final_height;
 }

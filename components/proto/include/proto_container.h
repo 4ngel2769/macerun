@@ -8,7 +8,10 @@
 #include "proto_framing.h"
 
 #define PROTO_CHEST_SLOTS 27
-#define PROTO_CHEST_WINDOW_TYPE 9
+/* Open Window inventoryType for generic_9x3 (chest) in protocol 754.
+ * Verified against the official 1.16.5 client MenuType registration order.
+ */
+#define PROTO_CHEST_WINDOW_TYPE 2
 #define PROTO_CHEST_WINDOW_ID 1
 #define PROTO_MAX_CHEST_INSTANCES 16
 

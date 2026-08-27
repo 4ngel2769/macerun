@@ -5,7 +5,9 @@
 
 #define PROTO_CRAFTING_GRID_SLOTS 9
 #define PROTO_CRAFTING_TABLE_WINDOW_ID 2
-#define PROTO_CRAFTING_TABLE_WINDOW_TYPE 1
+/* Open Window inventoryType for the 3x3 crafting menu in protocol 754
+ * ("crafting" = 11). Verified against the official 1.16.5 client. */
+#define PROTO_CRAFTING_TABLE_WINDOW_TYPE 11
 
 #define PROTO_ITEM_OAK_PLANKS 15
 #define PROTO_ITEM_SPRUCE_PLANKS 16

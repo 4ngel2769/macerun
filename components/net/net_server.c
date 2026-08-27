@@ -24,6 +24,10 @@
 #include "server_limits.h"
 
 #define NET_ATTACK_COOLDOWN_MS 500ULL
+/* Per-tick cap on received bytes processed for a single client. Prevents one
+ * fast-sending client from monopolizing the single server task and starving
+ * the other players (chunk floods, laggy uploads, malicious clients). */
+#define SERVER_RX_BUDGET_PER_TICK (24 * 1024)
 
 typedef struct
 {
@@ -821,10 +825,17 @@ static void process_client_rx(net_server_state_t *server,
                               uint64_t now_ms)
 {
     uint8_t rx_tmp[512];
+    size_t budget = SERVER_RX_BUDGET_PER_TICK;
 
-    while (client->in_use)
+    while (client->in_use && budget > 0)
     {
-        ssize_t received = recv(client->socket_fd, rx_tmp, sizeof(rx_tmp), 0);
+        size_t read_size = sizeof(rx_tmp);
+        if (read_size > budget)
+        {
+            read_size = budget;
+        }
+
+        ssize_t received = recv(client->socket_fd, rx_tmp, read_size, 0);
         if (received > 0)
         {
             size_t incoming = (size_t)received;
@@ -837,6 +848,7 @@ static void process_client_rx(net_server_state_t *server,
 
             memcpy(client->stream_buffer + client->stream_length, rx_tmp, incoming);
             client->stream_length += incoming;
+            budget -= incoming;
             process_stream_packets(server, client, now_ms);
             continue;
         }

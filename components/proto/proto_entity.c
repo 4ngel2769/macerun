@@ -478,11 +478,13 @@ static void ai_tick_mob(proto_mob_t *mob,
         break;
     }
 
+    /* dx = delta along world X, dy = delta along world Z (legacy naming).
+     * MC yaw convention: 0° faces +Z, 90° faces -X, so yaw = atan2(-dx, dz). */
     float dy = (float)(mob->target_z - mob->pos_z);
     float dx = (float)(mob->target_x - mob->pos_x);
     if (dx * dx + dy * dy > 0.01f)
     {
-        mob->yaw = (float)(atan2(-dy, dx) * 180.0f / 3.14159265f);
+        mob->yaw = (float)(atan2(-dx, dy) * 180.0f / 3.14159265f);
     }
 
     if (mob->ai_state == MOB_STATE_CHASING && nearest_idx >= 0)
@@ -609,7 +611,7 @@ static bool write_mob_spawn_packet(proto_writer_t *writer,
            write_f64_be(writer, mob->pos_z) &&
            proto_write_u8(writer, yaw_byte) &&
            proto_write_u8(writer, pitch_byte) &&
-           proto_write_u8(writer, pitch_byte) &&
+           proto_write_u8(writer, yaw_byte) &&
            write_i16_be(writer, vel_x) &&
            write_i16_be(writer, vel_y) &&
            write_i16_be(writer, vel_z);

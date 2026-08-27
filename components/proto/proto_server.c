@@ -2533,6 +2533,12 @@ static bool set_block_override(int32_t x,
 
     if (!world_deltas_put(&s_world_deltas, x, y, z, block_id))
     {
+        ESP_LOGE(TAG,
+                 "world delta store full (%u entries); block edit dropped at (%ld,%ld,%ld)",
+                 (unsigned int)WORLD_MAX_BLOCK_DELTAS,
+                 (long)x,
+                 (long)y,
+                 (long)z);
         return false;
     }
 
@@ -3506,13 +3512,21 @@ static bool send_respawn_packet(int socket_fd,
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
 
+    (void)connection;
+
+    /* 754 Respawn body: dimension NBT, world name string, hashed seed (long),
+     * gamemode (u8), previous gamemode (u8), isDebug (bool), isFlat (bool),
+     * copyMetadata (bool). The old implementation wrote a Position & Look
+     * style body here, which every 1.16.5 client rejected. */
     if (!proto_write_varint(&writer, active_profile()->s2c_play_respawn) ||
-        !write_f32_be(&writer, (float)connection->pos_x) ||
-        !write_f32_be(&writer, (float)connection->pos_y) ||
-        !write_f32_be(&writer, (float)connection->pos_z) ||
-        !write_f32_be(&writer, connection->yaw) ||
-        !write_f32_be(&writer, connection->pitch) ||
-        !proto_write_u8(&writer, connection->on_ground ? 1 : 0))
+        !write_dimension_nbt(&writer) ||
+        !proto_write_string(&writer, "minecraft:overworld") ||
+        !proto_write_i64_be(&writer, 0) ||
+        !proto_write_u8(&writer, 0) ||
+        !proto_write_u8(&writer, 0) ||
+        !proto_write_u8(&writer, 0) ||
+        !proto_write_u8(&writer, 0) ||
+        !proto_write_u8(&writer, 1))
     {
         return false;
     }

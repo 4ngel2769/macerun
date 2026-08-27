@@ -1,6 +1,8 @@
 #include "proto_crafting.h"
 #include "proto_profile.h"
 
+#include <stddef.h>
+
 #define CRAFT_COUNT (sizeof(s_recipes) / sizeof(s_recipes[0]))
 
 #define _S PROTO_ITEM_STICK

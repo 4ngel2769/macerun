@@ -1,10 +1,14 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define PROTO_MAX_MOBS 16
-#define PROTO_ENTITY_TYPE_ZOMBIE 32
+/* 1.16.5 Spawn Entity Living takes the modern entity-type registry id.
+ * minecraft:zombie = 102 (verified from the official 1.16.5 client
+ * EntityType registration order); 32 is hoglin, not zombie. */
+#define PROTO_ENTITY_TYPE_ZOMBIE 102
 
 #define PROTO_MOB_SPEED 0.23f
 #define PROTO_MOB_DETECTION_RANGE 16.0f
