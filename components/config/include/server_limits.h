@@ -19,7 +19,9 @@
 #define SERVER_MAX_PACKET_SIZE SERVER_MAX_INBOUND_PACKET_SIZE
 #define SERVER_SOCKET_SEND_STALL_RETRIES 200
 #define SERVER_SOCKET_SEND_WAIT_SLICE_MS 10
-#define SERVER_SOCKET_SEND_STALL_TIMEOUT_MS 30000
+/* Fail fast: 30 s of blocked send wedged the single net task (including
+ * keep-alives) long enough for the vanilla client to time out anyway. */
+#define SERVER_SOCKET_SEND_STALL_TIMEOUT_MS 8000
 
 #define SERVER_MAX_CHAT_MESSAGE_LENGTH 128
 

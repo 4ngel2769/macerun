@@ -23,6 +23,12 @@
 #include "proto_container.h"
 
 #define PROTO_KEEPALIVE_INTERVAL_MS 5000ULL
+
+/* Pacing for the chunk stream: one ~22 KB chunk per interval. Demanding a
+ * chunk every 25 ms tick (~870 KB/s) saturated the Wi-Fi TCP path, the client
+ * stopped ACKing, and the blocked send wedged the whole net task (which also
+ * owns keep-alives) until the 30 s stall timeout killed the session. */
+#define PROTO_CHUNK_STREAM_PACE_MS 100ULL
 #define PROTO_KEEPALIVE_TIMEOUT_MS 15000ULL
 #define PROTO_HUNGER_DECAY_INTERVAL_MS 30000ULL
 #define PROTO_HEALTH_REGEN_INTERVAL_MS 5000ULL
@@ -151,7 +157,7 @@ static EXT_RAM_BSS_ATTR uint8_t s_proto_chunk_data_buffer[SERVER_MAX_CHUNK_DATA_
 static const int32_t s_chunk_palette_state_ids[] = {
     0,
     1,
-    9,
+    8,
     10,
     14,
     33,
@@ -165,7 +171,7 @@ static const int32_t s_chunk_palette_state_ids[] = {
     16,
     3356,
     3374,
-    3765,
+    2034,
 };
 
 #define PROTO_CHUNK_PALETTE_SIZE ((int32_t)(sizeof(s_chunk_palette_state_ids) / sizeof(s_chunk_palette_state_ids[0])))
@@ -5549,7 +5555,17 @@ void proto_tick_connection(proto_connection_t *connection,
         }
     }
 
+    static uint64_t s_next_chunk_stream_ms;
+
     int32_t chunk_send_budget = SERVER_CHUNK_SENDS_PER_TICK;
+    if (now_ms < s_next_chunk_stream_ms)
+    {
+        chunk_send_budget = 0;
+    }
+    else if (chunk_send_budget > 0)
+    {
+        s_next_chunk_stream_ms = now_ms + PROTO_CHUNK_STREAM_PACE_MS;
+    }
 
     for (int32_t send_index = 0; send_index < chunk_send_budget; send_index++)
     {
