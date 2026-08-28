@@ -204,3 +204,6 @@ int32_t proto_next_entity_id(void);
 uint8_t proto_query_block_id(int32_t x, int32_t y, int32_t z);
 
 int16_t proto_query_surface_y(int32_t x, int32_t z);
+
+/* Diagnostic: log the most recent clientbound packets (id/length). */
+void proto_server_log_recent_tx(void);

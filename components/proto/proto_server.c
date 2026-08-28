@@ -54,7 +54,11 @@ typedef enum
 #define PROTO_HEIGHTMAP_LONG_COUNT 36
 #define PROTO_BIOME_ARRAY_COUNT (4 * 4 * 64)
 #define PROTO_CHUNK_LIGHT_EMPTY_MASK ((1 << PROTO_LIGHT_SECTION_COUNT) - 1)
-#define PROTO_CHUNK_BITS_PER_BLOCK 4
+/* 8 bits per block entry: the section palette has 17 entries, which does not
+ * fit the 16 slots a 4-bit container allows (chest = palette index 16 used to
+ * spill into neighboring block values and breaks the vanilla 16-slot linear
+ * palette limit for bits=4). 8 bits -> 8 entries per long, no bit spanning. */
+#define PROTO_CHUNK_BITS_PER_BLOCK 8
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
 #define PROTO_INVENTORY_NVS_KEY_PREFIX "inv_"
@@ -2738,19 +2742,19 @@ static bool encode_chunk_sections(int32_t chunk_x,
             }
         }
 
-        if (!proto_write_varint(&chunk_writer, PROTO_SECTION_VOLUME / 16))
+        if (!proto_write_varint(&chunk_writer, PROTO_SECTION_VOLUME / 8))
         {
             return false;
         }
 
-        for (int32_t long_index = 0; long_index < (PROTO_SECTION_VOLUME / 16); long_index++)
+        for (int32_t long_index = 0; long_index < (PROTO_SECTION_VOLUME / 8); long_index++)
         {
             uint64_t packed = 0;
-            for (int32_t value_index = 0; value_index < 16; value_index++)
+            for (int32_t value_index = 0; value_index < 8; value_index++)
             {
-                int32_t block_index = (long_index * 16) + value_index;
+                int32_t block_index = (long_index * 8) + value_index;
                 uint64_t palette_index = (uint64_t)palette_indices[block_index];
-                packed |= palette_index << (value_index * 4);
+                packed |= palette_index << (value_index * 8);
             }
 
             if (!proto_write_i64_be(&chunk_writer, (int64_t)packed))
@@ -2854,12 +2858,22 @@ static bool send_map_chunk_packet(int socket_fd,
         return false;
     }
 
+    /* 754 biome array: count varint (1024) followed by 1024 VARINT biome
+     * registry ids (1 = minecraft:plains). Writing each biome as a 4-byte
+     * int made the client consume only 1024 of the 4096 bytes: its next
+     * reads then decoded buffer length = 0 and block entities = 0 out of
+     * the remaining zero bytes, leaving 13458 unread bytes -> client aborts
+     * with "Packet 0/32 (pt) was larger than I expected, found 13458 bytes
+     * extra whilst reading packet 32". */
     for (int32_t i = 0; i < 1024; i++)
     {
-        if (!proto_write_varint(&writer, 1))   /* was: write_i32_be(&writer, 0) */
+        if (!proto_write_varint(&writer, 1))
         {
-            ESP_LOGW(TAG, "chunk biome write failed at (%ld,%ld): i=%d",
-                     (long)chunk_x, (long)chunk_z, (int)i);
+            ESP_LOGW(TAG,
+                     "chunk biome write failed at (%ld,%ld): i=%d",
+                     (long)chunk_x,
+                     (long)chunk_z,
+                     (int)i);
             return false;
         }
     }
@@ -2906,6 +2920,15 @@ static bool send_update_light_packet(int socket_fd,
     int32_t empty_sky_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
     int32_t empty_block_light_mask = PROTO_CHUNK_LIGHT_EMPTY_MASK;
 
+    /* 754 Update Light body: chunkX varint, chunkZ varint, trustEdges bool,
+     * skyLightMask varint, blockLightMask varint, emptySkyLightMask varint,
+     * emptyBlockLightMask varint, then ONE 2048-byte array per set bit in
+     * skyLightMask followed by one per set bit in blockLightMask.
+     * There are NO array-count fields in protocol 754 (counts were only
+     * introduced in 1.17+). Appending "count" varints here leaves 2 unread
+     * bytes, and the vanilla client aborts the join with
+     * "Packet 0/35 (pw) was larger than I expected, found 2 bytes extra".
+     * Both light masks are 0, so no light arrays are appended below. */
     if (!proto_write_varint(&writer, active_profile()->s2c_play_update_light) ||
         !proto_write_varint(&writer, chunk_x) ||
         !proto_write_varint(&writer, chunk_z) ||
@@ -3027,6 +3050,36 @@ static bool write_dimension_nbt(proto_writer_t *writer)
            nbt_end_compound(writer);
 }
 
+/* Ring of the most recent clientbound packets, logged when a client
+ * disconnects so the serial log names the packet the client choked on. */
+#define PROTO_TX_TRACE_DEPTH 8
+static struct
+{
+    uint16_t packet_id;
+    uint16_t length;
+} s_tx_trace[PROTO_TX_TRACE_DEPTH];
+static int s_tx_trace_next;
+
+void proto_server_log_recent_tx(void)
+{
+    char summary[192];
+    size_t used = (size_t)snprintf(summary, sizeof(summary), "recent tx:");
+    for (int i = 0; i < PROTO_TX_TRACE_DEPTH && used < sizeof(summary) - 16; i++)
+    {
+        int idx = (s_tx_trace_next + i) % PROTO_TX_TRACE_DEPTH;
+        if (s_tx_trace[idx].length == 0)
+        {
+            continue;
+        }
+        used += (size_t)snprintf(summary + used,
+                                 sizeof(summary) - used,
+                                 " 0x%02x/%u",
+                                 s_tx_trace[idx].packet_id,
+                                 (unsigned int)s_tx_trace[idx].length);
+    }
+    ESP_LOGW(TAG, "%s", summary);
+}
+
 static bool send_packet(int socket_fd,
                         const uint8_t *packet_body,
                         size_t packet_length,
@@ -3039,6 +3092,10 @@ static bool send_packet(int socket_fd,
     {
         return false;
     }
+
+    s_tx_trace[s_tx_trace_next].packet_id = (packet_length > 0) ? packet_body[0] : 0;
+    s_tx_trace[s_tx_trace_next].length = (uint16_t)(packet_length & 0xFFFFu);
+    s_tx_trace_next = (s_tx_trace_next + 1) % PROTO_TX_TRACE_DEPTH;
 
     if (packet_length > SERVER_MAX_OUTBOUND_PACKET_SIZE)
     {

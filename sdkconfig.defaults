@@ -1,10 +1,26 @@
+# macerun — ESP32-S3 ONLY (octal PSRAM board).
+# Pinning the target here is mandatory: without it, a fresh configure
+# (no local sdkconfig yet) silently falls back to plain ESP32, whose
+# .dram0.bss segment is far too small -> "region dram0_0_seg overflowed".
 CONFIG_IDF_TARGET="esp32s3"
+
+# CPU / optimization
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+
+# Console / logging
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+# Flash
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Octal PSRAM (8 MB) — world data and network buffers rely on it
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+
+# lwIP: compile in SO_RCVBUF support used by accepted client sockets.
+# (SO_SNDBUF has no Kconfig in newer IDF; that setsockopt is best-effort.)
+CONFIG_LWIP_SO_RCVBUF=y

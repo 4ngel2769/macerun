@@ -113,16 +113,20 @@ static bool set_non_blocking(int socket_fd)
     int one = 1;
     setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    /* Best-effort buffer sizing: lwIP only implements SO_SNDBUF/SO_RCVBUF when
+     * compiled with the matching options (LWIP_SO_RCVBUF Kconfig; newer IDF
+     * has no LWIP_SO_SNDBUF Kconfig at all). On unsupported targets these
+     * calls legitimately fail, so log at debug level to avoid console spam. */
     int send_buffer = 32 * 1024;
     if (setsockopt(socket_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) < 0)
     {
-        ESP_LOGW(TAG, "failed to set SO_SNDBUF: fd=%d errno=%d", socket_fd, errno);
+        ESP_LOGD(TAG, "SO_SNDBUF not applied: fd=%d errno=%d", socket_fd, errno);
     }
 
     int recv_buffer = 8 * 1024;
     if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer, sizeof(recv_buffer)) < 0)
     {
-        ESP_LOGW(TAG, "failed to set SO_RCVBUF: fd=%d errno=%d", socket_fd, errno);
+        ESP_LOGD(TAG, "SO_RCVBUF not applied: fd=%d errno=%d", socket_fd, errno);
     }
 
     return true;
@@ -282,6 +286,7 @@ static void close_client_with_reason(net_server_state_t *server,
         }
     }
 
+    proto_server_log_recent_tx();
     const char *safe_reason = (reason != NULL) ? reason : "unspecified";
     if (client->protocol.username[0] != '\0')
     {
