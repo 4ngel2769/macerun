@@ -2856,13 +2856,10 @@ static bool send_map_chunk_packet(int socket_fd,
 
     for (int32_t i = 0; i < 1024; i++)
     {
-        if (!write_i32_be(&writer, 0))
+        if (!proto_write_varint(&writer, 1))   /* was: write_i32_be(&writer, 0) */
         {
-            ESP_LOGW(TAG,
-                     "chunk biome write failed at (%ld,%ld): i=%d",
-                     (long)chunk_x,
-                     (long)chunk_z,
-                     i);
+            ESP_LOGW(TAG, "chunk biome write failed at (%ld,%ld): i=%d",
+                     (long)chunk_x, (long)chunk_z, (int)i);
             return false;
         }
     }
@@ -2916,9 +2913,7 @@ static bool send_update_light_packet(int socket_fd,
         !proto_write_varint(&writer, sky_light_mask) ||
         !proto_write_varint(&writer, block_light_mask) ||
         !proto_write_varint(&writer, empty_sky_light_mask) ||
-        !proto_write_varint(&writer, empty_block_light_mask) ||
-        !proto_write_varint(&writer, 0) ||
-        !proto_write_varint(&writer, 0))
+        !proto_write_varint(&writer, empty_block_light_mask))
     {
         ESP_LOGW(TAG,
                  "light packet write failed at (%ld,%ld)",
