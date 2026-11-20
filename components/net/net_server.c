@@ -240,7 +240,9 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
 
     if (slot < 0)
     {
-        ESP_LOGW(TAG, "send to unknown fd=%d", socket_fd);
+        /* A peer can disconnect mid-broadcast; entity/slot loops then still
+         * hold its old fd for the rest of this tick. That is normal churn —
+         * drop the write quietly instead of flooding the log. */
         return false;
     }
 
