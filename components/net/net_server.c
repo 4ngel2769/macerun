@@ -18,6 +18,7 @@
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 
+#include "net_errors.h"
 #include "proto_framing.h"
 #include "proto_profile.h"
 #include "proto_server.h"
@@ -978,7 +979,10 @@ static void server_task(void *arg)
 
     while (server->running)
     {
-        uint64_t now_ms = server->uptime_ms;
+        /* Wall-clock milliseconds from the FreeRTOS tick. Never use the
+         * loop-counter uptime_ms for timers: an overrunning tick would stretch
+         * keepalive, hunger, mob and persistence deadlines. */
+        uint64_t now_ms = net_ticks_to_ms(xTaskGetTickCount(), portTICK_PERIOD_MS);
 
         flush_pending_sends(server);
         accept_new_clients(server);
@@ -1093,6 +1097,7 @@ static void server_task(void *arg)
 
         proto_entity_broadcast_updates(player_fds, fd_count, socket_send_all, server);
 
+        /* Diagnostic only — no timer may read this. */
         server->uptime_ms += SERVER_TICK_MS;
 
         proto_tick_server(now_ms);

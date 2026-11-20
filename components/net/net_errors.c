@@ -2,6 +2,11 @@
 
 #include <errno.h>
 
+uint64_t net_ticks_to_ms(uint32_t ticks, uint32_t tick_period_ms)
+{
+    return (uint64_t)ticks * (uint64_t)tick_period_ms;
+}
+
 net_socket_result_t net_classify_socket_error(int err)
 {
     if (err == 0)
