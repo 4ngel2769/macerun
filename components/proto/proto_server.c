@@ -3609,7 +3609,8 @@ static bool send_player_position_look_packet(int socket_fd,
         !write_f64_be(&writer, connection->pos_z) ||
         !write_f32_be(&writer, connection->yaw) ||
         !write_f32_be(&writer, connection->pitch) ||
-        !proto_write_u8(&writer, connection->on_ground ? 1 : 0))
+        !proto_write_u8(&writer, connection->on_ground ? 1 : 0) ||
+        !proto_write_varint(&writer, 0))
     {
         return false;
     }
@@ -3936,6 +3937,28 @@ void proto_connection_reset(proto_connection_t *connection)
     reset_chunk_stream_state(connection);
 }
 
+/* Generated terrain can be well above sea level at spawn, and NVS may hold a
+ * saved position that is inside a hill. Lift the player to the surface. */
+static void ensure_spawn_above_terrain(proto_connection_t *connection)
+{
+    ensure_world_initialized();
+
+    int32_t world_x = (int32_t)floor(connection->pos_x);
+    int32_t world_z = (int32_t)floor(connection->pos_z);
+    int16_t surface_y = world_query_surface_y(&s_world_config, world_x, world_z);
+    double safe_y = (double)surface_y + 2.0;
+
+    if (connection->pos_y < safe_y)
+    {
+        ESP_LOGW(TAG,
+                 "spawn inside terrain at (%ld,%ld): y=%.2f -> %.2f",
+                 (long)world_x, (long)world_z, connection->pos_y, safe_y);
+        connection->pos_y = safe_y;
+        connection->prev_pos_y = safe_y;
+        connection->on_ground = false;
+    }
+}
+
 static void handle_handshake(proto_connection_t *connection, proto_reader_t *reader, int socket_fd, proto_send_callback_t send_fn, void *send_context)
 {
     int32_t protocol_version = 0;
@@ -4082,6 +4105,7 @@ static void handle_login(proto_connection_t *connection,
 
     load_player_inventory_from_nvs(connection);
     load_player_data_from_nvs(connection);
+    ensure_spawn_above_terrain(connection);
 
     if (!send_play_login(socket_fd, connection, server, send_fn, send_context) ||
         !send_initial_position(socket_fd, connection, send_fn, send_context))
@@ -5824,8 +5848,11 @@ static void handle_player_respawn(proto_connection_t *connection,
     connection->next_starvation_damage_ms = 0;
     connection->next_void_damage_ms = 0;
 
+    ensure_world_initialized();
+    int16_t spawn_surface_y = world_query_surface_y(&s_world_config, 0, 0);
+
     double spawn_x = 0.0;
-    double spawn_y = (double)s_world_config.sea_level + 1.0;
+    double spawn_y = (double)spawn_surface_y + 2.0;
     double spawn_z = 0.0;
 
     connection->pos_x = spawn_x;
@@ -5880,7 +5907,7 @@ void proto_server_save_world(void)
 
 void proto_tick_server(uint64_t now_ms)
 {
-    if (s_world_deltas_dirty && (now_ms - s_last_world_save_ms > 600000ULL))
+    if (s_world_deltas_dirty && (now_ms - s_last_world_save_ms > 30000ULL))
     {
         proto_server_save_world();
         s_last_world_save_ms = now_ms;

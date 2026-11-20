@@ -20,7 +20,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+# Required for EXT_RAM_BSS_ATTR to actually place large buffers in PSRAM.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 
 # lwIP: compile in SO_RCVBUF support used by accepted client sockets.
 # (SO_SNDBUF has no Kconfig in newer IDF; that setsockopt is best-effort.)
 CONFIG_LWIP_SO_RCVBUF=y
+
+# 1.16.5 chunk packets are ~22 KB. The lwIP defaults (5760 B) are smaller than
+# that, so send() drains in tiny pieces and select() spins for the whole
+# 8 s stall timeout, starving the single net task and dropping clients.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768

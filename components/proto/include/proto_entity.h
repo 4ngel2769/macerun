@@ -10,7 +10,9 @@
  * EntityType registration order); 32 is hoglin, not zombie. */
 #define PROTO_ENTITY_TYPE_ZOMBIE 102
 
-#define PROTO_MOB_SPEED 0.23f
+/* Blocks per 25 ms tick: 0.035 ~= 1.4 blocks/s at 40 ticks/s, slower than a
+ * sprinting player. The old 0.23 was ~9 blocks/s and made zombies outrun you. */
+#define PROTO_MOB_SPEED 0.035f
 #define PROTO_MOB_DETECTION_RANGE 16.0f
 #define PROTO_MOB_ATTACK_RANGE 2.0f
 #define PROTO_MOB_WANDER_RANGE 8.0f

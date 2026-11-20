@@ -26,6 +26,29 @@ static uint64_t s_last_spawn_attempt_ms = 0;
 static bool s_entity_initialized = false;
 
 static uint8_t s_proto_entity_buffer[512];
+static uint8_t s_proto_entity_framed_buffer[512 + PROTO_VARINT_MAX_LEN];
+
+/* Every clientbound play packet needs a VarInt length prefix. The rest of the
+ * server routes packets through send_packet() (which wraps them), but this
+ * module hands raw bodies to the supplied transport, so wrap them here. */
+static bool send_entity_packet(int socket_fd,
+                               const uint8_t *packet_body,
+                               size_t packet_length,
+                               proto_entity_send_fn send_fn,
+                               void *context)
+{
+    size_t framed_length = 0;
+    if (!proto_wrap_packet(packet_body,
+                           packet_length,
+                           s_proto_entity_framed_buffer,
+                           sizeof(s_proto_entity_framed_buffer),
+                           &framed_length))
+    {
+        return false;
+    }
+
+    return send_fn(context, socket_fd, s_proto_entity_framed_buffer, framed_length);
+}
 
 static int32_t next_mob_entity_id(void)
 {
@@ -645,8 +668,9 @@ void proto_entity_broadcast_updates(int player_socket_fds[],
 
             for (int j = 0; j < player_count; j++)
             {
-                if (!send_fn(context, player_socket_fds[j],
-                             s_proto_entity_buffer, writer.length))
+                if (!send_entity_packet(player_socket_fds[j],
+                                        s_proto_entity_buffer, writer.length,
+                                        send_fn, context))
                 {
                     ESP_LOGW(PROTO_ENTITY_TAG,
                              "spawn packet send failed for socket %d",
@@ -673,8 +697,9 @@ void proto_entity_broadcast_updates(int player_socket_fds[],
         {
             for (int j = 0; j < player_count; j++)
             {
-                if (!send_fn(context, player_socket_fds[j],
-                             s_proto_entity_buffer, writer.length))
+                if (!send_entity_packet(player_socket_fds[j],
+                                        s_proto_entity_buffer, writer.length,
+                                        send_fn, context))
                 {
                     ESP_LOGW(PROTO_ENTITY_TAG,
                              "destroy packet send failed for socket %d",
@@ -742,8 +767,9 @@ void proto_entity_broadcast_updates(int player_socket_fds[],
 
         for (int j = 0; j < player_count; j++)
         {
-            if (!send_fn(context, player_socket_fds[j],
-                         s_proto_entity_buffer, writer.length))
+            if (!send_entity_packet(player_socket_fds[j],
+                                    s_proto_entity_buffer, writer.length,
+                                    send_fn, context))
             {
                 ESP_LOGW(PROTO_ENTITY_TAG,
                          "move packet send failed for socket %d",

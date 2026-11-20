@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -57,7 +58,70 @@ typedef struct
 static const char *TAG = "net_server";
 static net_server_state_t s_server;
 
+/* A single 22 KB chunk packet does not fit in lwIP's TCP send buffer. If we
+ * block the one net task until it drains, incoming chat/interact packets go
+ * unread and keepalives stall. Instead, queue any unsent tail in PSRAM and
+ * flush it a little more on every server tick. */
+#define NET_PENDING_SEND_CAPACITY (SERVER_MAX_OUTBOUND_PACKET_SIZE + 8)
+static EXT_RAM_BSS_ATTR uint8_t s_pending_send[SERVER_MAX_PLAYERS][NET_PENDING_SEND_CAPACITY];
+static size_t s_pending_length[SERVER_MAX_PLAYERS];
+static size_t s_pending_offset[SERVER_MAX_PLAYERS];
+
 static bool username_equals_ignore_case(const char *left, const char *right);
+
+static int client_slot_by_fd(const net_server_state_t *server, int socket_fd)
+{
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        if (server->clients[i].in_use && server->clients[i].socket_fd == socket_fd)
+        {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void clear_pending_send(int slot)
+{
+    if (slot < 0 || slot >= SERVER_MAX_PLAYERS)
+    {
+        return;
+    }
+    s_pending_length[slot] = 0;
+    s_pending_offset[slot] = 0;
+}
+
+/* Called once per tick: push as much of each queued tail as the socket allows. */
+static void flush_pending_sends(net_server_state_t *server)
+{
+    for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+    {
+        net_client_t *client = &server->clients[i];
+        if (!client->in_use || s_pending_length[i] <= s_pending_offset[i])
+        {
+            continue;
+        }
+
+        size_t remaining = s_pending_length[i] - s_pending_offset[i];
+        ssize_t result = send(client->socket_fd,
+                              s_pending_send[i] + s_pending_offset[i],
+                              remaining,
+                              0);
+        if (result > 0)
+        {
+            s_pending_offset[i] += (size_t)result;
+            if (s_pending_offset[i] >= s_pending_length[i])
+            {
+                clear_pending_send((int)i);
+            }
+        }
+        else if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        {
+            ESP_LOGW(TAG, "pending send failed: fd=%d errno=%d", client->socket_fd, errno);
+            client->protocol.close_requested = true;
+        }
+    }
+}
 
 /* Only applies damage here. Death is detected later in tick_survival_state by
  * the health<=0 latch, so all death packets come from one place. */
@@ -142,89 +206,56 @@ static bool set_non_blocking(int socket_fd)
 
 static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, size_t length)
 {
-    (void)context;
+    net_server_state_t *server = (net_server_state_t *)context;
+    int slot = client_slot_by_fd(server, socket_fd);
 
-    size_t sent = 0;
-    uint32_t stalled_retries = 0;
-    uint32_t max_stalled_retries = SERVER_SOCKET_SEND_STALL_RETRIES * 5;
-    TickType_t stall_started_ticks = 0;
-
-    if (length > 2048)
+    if (slot < 0)
     {
-        uint32_t scaled_retries = (uint32_t)(length / 4);
-        if (scaled_retries > max_stalled_retries)
-        {
-            max_stalled_retries = scaled_retries;
-        }
-        if (max_stalled_retries > 8000)
-        {
-            max_stalled_retries = 8000;
-        }
+        ESP_LOGW(TAG, "send to unknown fd=%d", socket_fd);
+        return false;
     }
 
+    /* Preserve ordering: if a previous packet still has a queued tail, append
+     * this one behind it. This should be rare (same task sends sequentially). */
+    if (s_pending_length[slot] > s_pending_offset[slot])
+    {
+        size_t queued = s_pending_length[slot] - s_pending_offset[slot];
+        if (queued + length > NET_PENDING_SEND_CAPACITY)
+        {
+            ESP_LOGE(TAG, "pending send overflow: fd=%d queued=%u add=%u",
+                     socket_fd, (unsigned int)queued, (unsigned int)length);
+            return false;
+        }
+        memcpy(s_pending_send[slot] + s_pending_length[slot], data, length);
+        s_pending_length[slot] += length;
+        return true;
+    }
+
+    size_t sent = 0;
     while (sent < length)
     {
         ssize_t result = send(socket_fd, data + sent, length - sent, 0);
         if (result > 0)
         {
             sent += (size_t)result;
-            stalled_retries = 0;
-            stall_started_ticks = 0;
             continue;
         }
 
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            if (stall_started_ticks == 0)
+            /* Do not spin here: hand the remainder to the per-tick flusher so
+             * this task can keep reading client input and sending keepalives. */
+            size_t remaining = length - sent;
+            if (remaining > NET_PENDING_SEND_CAPACITY)
             {
-                stall_started_ticks = xTaskGetTickCount();
-            }
-
-            stalled_retries++;
-            uint32_t stalled_ms = (uint32_t)((xTaskGetTickCount() - stall_started_ticks) * portTICK_PERIOD_MS);
-            if (stalled_retries > max_stalled_retries ||
-                stalled_ms >= SERVER_SOCKET_SEND_STALL_TIMEOUT_MS)
-            {
-                ESP_LOGW(TAG,
-                         "send stalled: fd=%d sent=%u/%u retries=%u stalled_ms=%u",
-                         socket_fd,
-                         (unsigned int)sent,
-                         (unsigned int)length,
-                         (unsigned int)stalled_retries,
-                         (unsigned int)stalled_ms);
+                ESP_LOGE(TAG, "packet too large to queue: fd=%d len=%u",
+                         socket_fd, (unsigned int)remaining);
                 return false;
             }
-
-            fd_set write_fds;
-            FD_ZERO(&write_fds);
-            FD_SET(socket_fd, &write_fds);
-
-            struct timeval wait_timeout = {
-                .tv_sec = 0,
-                .tv_usec = (int)(SERVER_SOCKET_SEND_WAIT_SLICE_MS * 1000),
-            };
-
-            int ready = select(socket_fd + 1, NULL, &write_fds, NULL, &wait_timeout);
-            if (ready > 0)
-            {
-                continue;
-            }
-            if (ready == 0)
-            {
-                continue;
-            }
-            if (errno == EINTR)
-            {
-                continue;
-            }
-
-            ESP_LOGW(TAG,
-                     "send wait failed: fd=%d sent=%u/%u errno=%d",
-                     socket_fd,
-                     (unsigned int)sent,
-                     (unsigned int)length,
-                     errno);
-            return false;
+            memcpy(s_pending_send[slot], data + sent, remaining);
+            s_pending_length[slot] = remaining;
+            s_pending_offset[slot] = 0;
+            return true;
         }
 
         if (result < 0 && errno == EINTR)
@@ -232,24 +263,8 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
             continue;
         }
 
-        if (result < 0)
-        {
-            ESP_LOGW(TAG,
-                     "send failed: fd=%d sent=%u/%u errno=%d",
-                     socket_fd,
-                     (unsigned int)sent,
-                     (unsigned int)length,
-                     errno);
-        }
-        else
-        {
-            ESP_LOGW(TAG,
-                     "send returned zero: fd=%d sent=%u/%u",
-                     socket_fd,
-                     (unsigned int)sent,
-                     (unsigned int)length);
-        }
-
+        ESP_LOGW(TAG, "send failed: fd=%d sent=%u/%u errno=%d",
+                 socket_fd, (unsigned int)sent, (unsigned int)length, errno);
         return false;
     }
 
@@ -312,6 +327,7 @@ static void close_client_with_reason(net_server_state_t *server,
         persist_player_data_to_nvs(&client->protocol);
     }
 
+    clear_pending_send((int)(client - server->clients));
     close(client->socket_fd);
     memset(client, 0, sizeof(*client));
 
@@ -519,6 +535,7 @@ static void accept_new_clients(net_server_state_t *server)
         {
             if (!server->clients[i].in_use)
             {
+                clear_pending_send((int)i);
                 server->clients[i].in_use = true;
                 server->clients[i].socket_fd = client_fd;
                 server->clients[i].stream_length = 0;
@@ -963,6 +980,7 @@ static void server_task(void *arg)
     {
         uint64_t now_ms = server->uptime_ms;
 
+        flush_pending_sends(server);
         accept_new_clients(server);
 
         for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
