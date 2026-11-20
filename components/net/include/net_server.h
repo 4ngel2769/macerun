@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 typedef struct
 {
@@ -18,6 +20,8 @@ esp_err_t net_server_start(const net_server_config_t *config);
 void net_server_stop(void);
 bool net_server_is_running(void);
 uint8_t net_server_online_players(void);
+/* Register the console task handle so health logs can report its stack HWM. */
+void net_server_set_console_task(TaskHandle_t task_handle);
 esp_err_t net_server_broadcast_chat(const char *message);
 esp_err_t net_server_give_item(const char *target,
                                const char *item_name,

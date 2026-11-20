@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,7 @@
 #include "lwip/tcp.h"
 
 #include "net_errors.h"
+#include "persist_worker.h"
 #include "proto_framing.h"
 #include "proto_profile.h"
 #include "proto_server.h"
@@ -70,6 +72,17 @@ static size_t s_pending_length[SERVER_MAX_PLAYERS];
 static size_t s_pending_offset[SERVER_MAX_PLAYERS];
 static bool s_pending_is_low[SERVER_MAX_PLAYERS];
 static uint32_t s_low_drop_count[SERVER_MAX_PLAYERS];
+
+/* Health monitoring: max tick duration and peak pending queue since last log. */
+static uint32_t s_tick_max_ms = 0;
+static size_t s_queue_peak = 0;
+static uint64_t s_next_health_log_ms = 0;
+static TaskHandle_t s_console_task_handle = NULL;
+
+void net_server_set_console_task(TaskHandle_t handle)
+{
+    s_console_task_handle = handle;
+}
 
 static bool username_equals_ignore_case(const char *left, const char *right);
 static void close_client_with_reason(net_server_state_t *server,
@@ -1057,6 +1070,7 @@ static void server_task(void *arg)
          * loop-counter uptime_ms for timers: an overrunning tick would stretch
          * keepalive, hunger, mob and persistence deadlines. */
         uint64_t now_ms = net_ticks_to_ms(xTaskGetTickCount(), portTICK_PERIOD_MS);
+        uint32_t tick_started_ms = (uint32_t)now_ms;
 
         flush_pending_sends(server);
         accept_new_clients(server);
@@ -1175,6 +1189,50 @@ static void server_task(void *arg)
         server->uptime_ms += SERVER_TICK_MS;
 
         proto_tick_server(now_ms);
+
+        /* Health telemetry: max tick duration and queue peak since last report. */
+        uint32_t tick_ms = (uint32_t)now_ms - tick_started_ms;
+        if (tick_ms > s_tick_max_ms)
+        {
+            s_tick_max_ms = tick_ms;
+        }
+        for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+        {
+            size_t queued = s_pending_length[i] > s_pending_offset[i]
+                                ? s_pending_length[i] - s_pending_offset[i] : 0;
+            if (queued > s_queue_peak)
+            {
+                s_queue_peak = queued;
+            }
+        }
+
+        if (now_ms >= s_next_health_log_ms)
+        {
+            s_next_health_log_ms = now_ms + 10000ULL;
+            uint32_t net_hw = server->task ? uxTaskGetStackHighWaterMark(server->task) : 0;
+            uint32_t console_hw = s_console_task_handle
+                                      ? uxTaskGetStackHighWaterMark(s_console_task_handle) : 0;
+            uint32_t low_drops = 0;
+            for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
+            {
+                low_drops += s_low_drop_count[i];
+            }
+            ESP_LOGW(TAG,
+                     "health: tick_max=%ums heap=%u psram=%u net_hw=%u console_hw=%u "
+                     "clients=%u queue_max=%u low_drops=%u coalesces=%u nvs_fail=%u",
+                     (unsigned int)s_tick_max_ms,
+                     (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned int)net_hw,
+                     (unsigned int)console_hw,
+                     (unsigned int)count_online_players(server),
+                     (unsigned int)s_queue_peak,
+                     (unsigned int)low_drops,
+                     (unsigned int)persist_coalesce_count(),
+                     (unsigned int)persist_failure_count());
+            s_tick_max_ms = 0;
+            s_queue_peak = 0;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(SERVER_TICK_MS));
     }

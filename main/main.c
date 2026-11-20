@@ -669,12 +669,17 @@ void app_main(void)
 
     start_mc_server();
 
+    TaskHandle_t console_handle = NULL;
     BaseType_t console_ok = xTaskCreate(serial_console_task,
                                         "serial_console",
                                         SERIAL_CONSOLE_STACK,
                                         NULL,
                                         SERIAL_CONSOLE_PRIORITY,
-                                        NULL);
+                                        &console_handle);
+    if (console_ok == pdPASS)
+    {
+        net_server_set_console_task(console_handle);
+    }
     if (console_ok != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to start serial console task");
