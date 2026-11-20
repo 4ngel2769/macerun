@@ -2,6 +2,23 @@
 
 #include <errno.h>
 
+net_packet_priority_t net_packet_priority(uint8_t packet_id)
+{
+    switch (packet_id)
+    {
+    case 0x20: /* chunk data */
+    case 0x23: /* update light */
+    case 0x1F: /* keepalive */
+    case 0x02: /* login success */
+    case 0x24: /* join game */
+    case 0x39: /* respawn */
+    case 0x34: /* player position/look */
+        return NET_PACKET_HIGH;
+    default:
+        return NET_PACKET_LOW;
+    }
+}
+
 uint64_t net_ticks_to_ms(uint32_t ticks, uint32_t tick_period_ms)
 {
     return (uint64_t)ticks * (uint64_t)tick_period_ms;

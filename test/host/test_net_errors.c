@@ -49,6 +49,21 @@ static void test_two_peers_left(void)
     assert(net_classify_socket_error(EPIPE) == NET_PEER_LEFT);
 }
 
+static void test_packet_priority(void)
+{
+    /* High-value packets must never be dropped to make room for a chunk. */
+    const uint8_t high[] = {0x20, 0x23, 0x1F, 0x02, 0x24, 0x39, 0x34};
+    for (size_t i = 0; i < sizeof(high); i++)
+    {
+        assert(net_packet_priority(high[i]) == NET_PACKET_HIGH);
+    }
+    const uint8_t low[] = {0x0E, 0x27, 0x28, 0x15};
+    for (size_t i = 0; i < sizeof(low); i++)
+    {
+        assert(net_packet_priority(low[i]) == NET_PACKET_LOW);
+    }
+}
+
 static void test_monotonic_ms_formula(void)
 {
     assert(net_ticks_to_ms(0u, 1u) == 0u);
@@ -59,6 +74,7 @@ static void test_monotonic_ms_formula(void)
 
 int main(void)
 {
+    test_packet_priority();
     test_monotonic_ms_formula();
     test_eof_is_peer_left();
     test_retryable_errors();

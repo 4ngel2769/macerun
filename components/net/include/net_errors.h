@@ -19,3 +19,13 @@ typedef enum
 } net_socket_result_t;
 
 net_socket_result_t net_classify_socket_error(int err);
+
+typedef enum
+{
+    NET_PACKET_LOW = 0,
+    NET_PACKET_HIGH
+} net_packet_priority_t;
+
+/* High value: chunk/light/keepalive/login/join/respawn/position.
+ * Low value: chat, entity movement, slot updates, cosmetic packets. */
+net_packet_priority_t net_packet_priority(uint8_t packet_id);

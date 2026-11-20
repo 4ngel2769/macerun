@@ -68,6 +68,8 @@ static net_server_state_t s_server;
 static EXT_RAM_BSS_ATTR uint8_t s_pending_send[SERVER_MAX_PLAYERS][NET_PENDING_SEND_CAPACITY];
 static size_t s_pending_length[SERVER_MAX_PLAYERS];
 static size_t s_pending_offset[SERVER_MAX_PLAYERS];
+static bool s_pending_is_low[SERVER_MAX_PLAYERS];
+static uint32_t s_low_drop_count[SERVER_MAX_PLAYERS];
 
 static bool username_equals_ignore_case(const char *left, const char *right);
 static void close_client_with_reason(net_server_state_t *server,
@@ -236,7 +238,22 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
         size_t queued = s_pending_length[slot] - s_pending_offset[slot];
         if (queued + length > NET_PENDING_SEND_CAPACITY)
         {
-            ESP_LOGE(TAG, "pending send overflow: fd=%d queued=%u add=%u",
+            net_packet_priority_t incoming_priority =
+                net_packet_priority(length > 0 ? data[0] : 0);
+            /* Make room by discarding a queued low-value tail for a
+             * high-value packet. Chunk data is never dropped silently. */
+            if (incoming_priority == NET_PACKET_HIGH && s_pending_is_low[slot] &&
+                length <= NET_PENDING_SEND_CAPACITY)
+            {
+                s_low_drop_count[slot]++;
+                s_pending_length[slot] = 0;
+                s_pending_offset[slot] = 0;
+                memcpy(s_pending_send[slot], data, length);
+                s_pending_length[slot] = length;
+                s_pending_is_low[slot] = false;
+                return true;
+            }
+            ESP_LOGW(TAG, "pending send overflow: fd=%d queued=%u add=%u",
                      socket_fd, (unsigned int)queued, (unsigned int)length);
             return false;
         }
@@ -269,6 +286,8 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
             memcpy(s_pending_send[slot], data + sent, remaining);
             s_pending_length[slot] = remaining;
             s_pending_offset[slot] = 0;
+            s_pending_is_low[slot] =
+                (net_packet_priority(length > 0 ? data[0] : 0) == NET_PACKET_LOW);
             return true;
         }
 
