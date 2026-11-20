@@ -40,6 +40,7 @@ _Static_assert(SERVER_RX_STREAM_BUFFER >= SERVER_MAX_INBOUND_PACKET_SIZE + PROTO
 typedef struct
 {
     bool in_use;
+    bool closing; /* set at the start of teardown so concurrent paths are no-ops */
     int socket_fd;
     uint8_t stream_buffer[SERVER_RX_STREAM_BUFFER];
     size_t stream_length;
@@ -69,6 +70,9 @@ static size_t s_pending_length[SERVER_MAX_PLAYERS];
 static size_t s_pending_offset[SERVER_MAX_PLAYERS];
 
 static bool username_equals_ignore_case(const char *left, const char *right);
+static void close_client_with_reason(net_server_state_t *server,
+                                     net_client_t *client,
+                                     const char *reason);
 
 static int client_slot_by_fd(const net_server_state_t *server, int socket_fd)
 {
@@ -118,8 +122,17 @@ static void flush_pending_sends(net_server_state_t *server)
         }
         else if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
         {
-            ESP_LOGW(TAG, "pending send failed: fd=%d errno=%d", client->socket_fd, errno);
-            client->protocol.close_requested = true;
+            net_socket_result_t outcome = net_classify_socket_error(errno);
+            if (outcome == NET_PEER_LEFT)
+            {
+                close_client_with_reason(server, client, "peer closed connection");
+            }
+            else
+            {
+                ESP_LOGW(TAG, "pending send failed: fd=%d errno=%d cls=%d",
+                         client->socket_fd, errno, (int)outcome);
+                client->protocol.close_requested = true;
+            }
         }
     }
 }
@@ -264,8 +277,21 @@ static bool socket_send_all(void *context, int socket_fd, const uint8_t *data, s
             continue;
         }
 
-        ESP_LOGW(TAG, "send failed: fd=%d sent=%u/%u errno=%d",
-                 socket_fd, (unsigned int)sent, (unsigned int)length, errno);
+        net_socket_result_t outcome = net_classify_socket_error(errno);
+        if (outcome == NET_PEER_LEFT)
+        {
+            net_client_t *client = &server->clients[slot];
+            close_client_with_reason(server, client, "peer closed connection");
+        }
+        else if (outcome == NET_RESOURCE_PRESSURE)
+        {
+            ESP_LOGW(TAG, "send resource pressure: fd=%d errno=%d", socket_fd, errno);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "send failed: fd=%d sent=%u/%u errno=%d",
+                     socket_fd, (unsigned int)sent, (unsigned int)length, errno);
+        }
         return false;
     }
 
@@ -276,10 +302,11 @@ static void close_client_with_reason(net_server_state_t *server,
                                      net_client_t *client,
                                      const char *reason)
 {
-    if (!client->in_use)
+    if (!client->in_use || client->closing)
     {
         return;
     }
+    client->closing = true;
 
     if (client->protocol.joined_play)
     {
@@ -310,18 +337,33 @@ static void close_client_with_reason(net_server_state_t *server,
         }
     }
 
-    proto_server_log_recent_tx();
     const char *safe_reason = (reason != NULL) ? reason : "unspecified";
+    /* A client closing its side (EOF / ECONNRESET / EPIPE) is normal churn —
+     * one quiet line. Internal faults and protocol violations stay at WARN. */
+    bool quiet = (strcmp(safe_reason, "peer closed connection") == 0 ||
+                  strcmp(safe_reason, "recv error: peer left") == 0 ||
+                  strcmp(safe_reason, "send failed: peer left") == 0);
     if (client->protocol.username[0] != '\0')
     {
-        ESP_LOGW(TAG, "client disconnected: user=%s fd=%d reason=%s",
-                 client->protocol.username, client->socket_fd, safe_reason);
+        if (quiet)
+        {
+            ESP_LOGI(TAG, "peer left: user=%s fd=%d", client->protocol.username, client->socket_fd);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "client disconnected: user=%s fd=%d reason=%s",
+                     client->protocol.username, client->socket_fd, safe_reason);
+        }
+    }
+    else if (quiet)
+    {
+        ESP_LOGI(TAG, "peer left: fd=%d", client->socket_fd);
     }
     else
     {
-        ESP_LOGW(TAG, "client disconnected: fd=%d reason=%s",
-                 client->socket_fd, safe_reason);
+        ESP_LOGW(TAG, "client disconnected: fd=%d reason=%s", client->socket_fd, safe_reason);
     }
+    proto_server_log_recent_tx();
 
     if (client->protocol.joined_play && client->protocol.username[0] != '\0')
     {
@@ -913,8 +955,21 @@ static void process_client_rx(net_server_state_t *server,
             return;
         }
 
-        ESP_LOGW(TAG, "recv failed, disconnecting client: errno=%d", errno);
-        close_client_with_reason(server, client, "recv error");
+        net_socket_result_t outcome = net_classify_socket_error(errno);
+        if (outcome == NET_PEER_LEFT)
+        {
+            close_client_with_reason(server, client, "peer closed connection");
+        }
+        else if (outcome == NET_PROTOCOL_ERROR)
+        {
+            ESP_LOGW(TAG, "recv protocol error: fd=%d errno=%d", client->socket_fd, errno);
+            close_client_with_reason(server, client, "recv protocol error");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "recv failed: fd=%d errno=%d", client->socket_fd, errno);
+            close_client_with_reason(server, client, "recv error");
+        }
         return;
     }
 }
