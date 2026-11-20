@@ -17,10 +17,12 @@
 #include "esp_rom_md5.h"
 #include "proto_framing.h"
 #include "proto_profile.h"
+#include "persist_worker.h"
 #include "server_limits.h"
 #include "block_deltas.h"
 #include "world_query.h"
 #include "proto_container.h"
+#include "persist_worker.h"
 
 #define PROTO_KEEPALIVE_INTERVAL_MS 5000ULL
 
@@ -70,6 +72,10 @@ typedef enum
 #define PROTO_CHUNK_BITS_PER_BLOCK 8
 #define PROTO_WORLD_NVS_NAMESPACE "macerun"
 #define PROTO_WORLD_NVS_KEY "world_deltas"
+/* Bump when terrain/biome generation changes: old deltas were authored against
+ * a different heightfield and would otherwise appear floating or buried. */
+#define PROTO_WORLD_GEN_VERSION_KEY "world_gen_ver"
+#define PROTO_WORLD_GEN_VERSION 2
 #define PROTO_INVENTORY_NVS_KEY_PREFIX "inv_"
 #define PROTO_PLAYER_DATA_NVS_KEY_PREFIX "plr_"
 #define PROTO_KEEPALIVE_RETRY_DELAY_MS 1000ULL
@@ -764,7 +770,7 @@ static bool write_block_position(proto_writer_t *writer,
 static bool load_world_deltas_from_nvs(void)
 {
     nvs_handle_t handle = 0;
-    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         return true;
@@ -774,6 +780,21 @@ static bool load_world_deltas_from_nvs(void)
     {
         ESP_LOGW(TAG, "nvs_open(read) failed: %s", esp_err_to_name(err));
         return false;
+    }
+
+    uint32_t saved_version = 0;
+    err = nvs_get_u32(handle, PROTO_WORLD_GEN_VERSION_KEY, &saved_version);
+    if (err == ESP_ERR_NVS_NOT_FOUND || saved_version != PROTO_WORLD_GEN_VERSION)
+    {
+        ESP_LOGW(TAG,
+                 "world generator changed (%u -> %u); discarding old map",
+                 (unsigned int)saved_version,
+                 (unsigned int)PROTO_WORLD_GEN_VERSION);
+        nvs_erase_key(handle, PROTO_WORLD_NVS_KEY);
+        nvs_set_u32(handle, PROTO_WORLD_GEN_VERSION_KEY, PROTO_WORLD_GEN_VERSION);
+        nvs_commit(handle);
+        nvs_close(handle);
+        return true;
     }
 
     size_t blob_size = 0;
@@ -833,46 +854,42 @@ static bool load_world_deltas_from_nvs(void)
     return true;
 }
 
+/* Snapshots are queued to the persistence worker; the slow erase+write never
+ * runs on the net task. The returned job id is acknowledged via
+ * persist_job_committed() before s_world_deltas_dirty is cleared. */
+static uint32_t s_pending_world_job = 0;
+
 static bool persist_world_deltas_to_nvs(void)
 {
-    nvs_handle_t handle = 0;
-    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK)
+    if (s_pending_world_job != 0)
     {
-        ESP_LOGW(TAG, "nvs_open(write) failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    if (s_world_deltas.count == 0)
-    {
-        err = nvs_erase_key(handle, PROTO_WORLD_NVS_KEY);
-        if (err == ESP_ERR_NVS_NOT_FOUND)
+        if (!persist_job_committed(s_pending_world_job))
         {
-            err = ESP_OK;
+            return false;
         }
-    }
-    else
-    {
-        size_t data_size = s_world_deltas.count * sizeof(world_block_delta_t);
-        err = nvs_set_blob(handle,
-                           PROTO_WORLD_NVS_KEY,
-                           s_world_deltas.entries,
-                           data_size);
+        s_pending_world_job = 0;
+        ESP_LOGW(TAG,
+                 "world state saved to NVS: %u block deltas",
+                 (unsigned int)s_world_deltas.count);
     }
 
-    if (err == ESP_OK)
+    if (!s_world_deltas_dirty)
     {
-        err = nvs_commit(handle);
+        return true; /* nothing new to queue */
     }
 
-    nvs_close(handle);
-
-    if (err != ESP_OK)
+    uint32_t job = persist_world_deltas_submit(s_world_deltas.entries,
+                                               s_world_deltas.count,
+                                               sizeof(world_block_delta_t));
+    if (job == 0)
     {
-        ESP_LOGW(TAG, "world delta persist failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "world delta persist queue full; will retry next tick");
         return false;
     }
-
+    s_pending_world_job = job;
+    /* Clear here so the per-tick acknowledgment poll cannot resubmit the same
+     * snapshot. Any edit landing while the worker writes sets dirty again. */
+    s_world_deltas_dirty = false;
     return true;
 }
 
@@ -1170,30 +1187,11 @@ bool persist_player_data_to_nvs(const proto_connection_t *connection)
         return false;
     }
 
-    nvs_handle_t handle = 0;
-    esp_err_t err = nvs_open(PROTO_WORLD_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK)
+    if (persist_player_data_submit(key, blob_data, sizeof(blob_data)) == 0)
     {
-        ESP_LOGW(TAG, "player data nvs_open(write) failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "player data persist queue full for user=%s", connection->username);
         return false;
     }
-
-    err = nvs_set_blob(handle, key, blob_data, sizeof(blob_data));
-    if (err == ESP_OK)
-    {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG,
-                 "player data persist failed for user=%s: %s",
-                 connection->username,
-                 esp_err_to_name(err));
-        return false;
-    }
-
     return true;
 }
 
@@ -4103,6 +4101,14 @@ static void handle_login(proto_connection_t *connection,
     connection->last_activity_ms = now_ms;
     initialize_survival_state(connection, now_ms);
 
+    /* Default to the generated surface at the world origin; NVS data below
+     * overrides this for returning players (and is clamped if it was buried). */
+    ensure_world_initialized();
+    int16_t default_surface_y = world_query_surface_y(&s_world_config, 0, 0);
+    connection->pos_x = 0.0;
+    connection->pos_y = (double)default_surface_y + 2.0;
+    connection->pos_z = 0.0;
+
     load_player_inventory_from_nvs(connection);
     load_player_data_from_nvs(connection);
     ensure_spawn_above_terrain(connection);
@@ -5896,17 +5902,16 @@ static void handle_play_client_status(proto_connection_t *connection,
 
 void proto_server_save_world(void)
 {
-    if (s_world_deltas_dirty)
-    {
-        if (persist_world_deltas_to_nvs())
-        {
-            s_world_deltas_dirty = false;
-        }
-    }
+    /* persist_world_deltas_to_nvs() clears the dirty flag on successful
+     * submit; this wrapper is kept for the disconnect path. */
+    (void)persist_world_deltas_to_nvs();
 }
 
 void proto_tick_server(uint64_t now_ms)
 {
+    /* Poll the pending job acknowledgment even when no fresh edit exists, so
+     * the "saved" log and the dirty-clear bookkeeping make progress. */
+    (void)persist_world_deltas_to_nvs();
     if (s_world_deltas_dirty && (now_ms - s_last_world_save_ms > 30000ULL))
     {
         proto_server_save_world();

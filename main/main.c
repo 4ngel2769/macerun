@@ -33,6 +33,7 @@
 #include "nvs_flash.h"
 
 #include "net_server.h"
+#include "persist_worker.h"
 #include "server_limits.h"
 
 #ifndef CONFIG_MACERUN_STA_SSID
@@ -650,6 +651,7 @@ void app_main(void)
 {
     init_nvs();
     init_server_config();
+    ESP_ERROR_CHECK(persist_worker_init());
     init_wifi_stack();
 
     if (init_wifi_sta_with_timeout())
