@@ -78,7 +78,8 @@
 
 #define PROTO_CRAFT_TAG_PLANK 0xFFF1
 
-typedef struct {
+typedef struct
+{
     uint8_t width;
     uint8_t height;
     uint16_t pattern[PROTO_CRAFTING_GRID_SLOTS];
@@ -86,7 +87,8 @@ typedef struct {
     uint8_t output_count;
 } proto_table_shaped_recipe_t;
 
-typedef struct {
+typedef struct
+{
     uint16_t item_id;
     uint8_t count;
     uint16_t consume_mask;

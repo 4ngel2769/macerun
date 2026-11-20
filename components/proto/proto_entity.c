@@ -52,8 +52,10 @@ static void generate_mob_uuid(int64_t *most, int64_t *least)
 
 static int32_t clamp_i32(int32_t value, int32_t min_val, int32_t max_val)
 {
-    if (value < min_val) return min_val;
-    if (value > max_val) return max_val;
+    if (value < min_val)
+        return min_val;
+    if (value > max_val)
+        return max_val;
     return value;
 }
 
@@ -128,9 +130,9 @@ void proto_entity_init(void)
 }
 
 int32_t proto_entity_spawn_mob(uint8_t entity_type,
-                                double x,
-                                double y,
-                                double z)
+                               double x,
+                               double y,
+                               double z)
 {
     int slot = find_free_mob_slot();
     if (slot < 0)
@@ -215,7 +217,7 @@ static bool block_is_passable(int32_t x, int32_t y, int32_t z)
 }
 
 static bool can_step_to(double x, double y, double z,
-                         double dx, double dz)
+                        double dx, double dz)
 {
     double nx = x + dx;
     double nz = z + dz;
@@ -240,9 +242,9 @@ static bool can_step_to(double x, double y, double z,
 }
 
 static void move_toward(proto_mob_t *mob,
-                         double target_x,
-                         double target_z,
-                         float speed)
+                        double target_x,
+                        double target_z,
+                        float speed)
 {
     double dx = target_x - mob->pos_x;
     double dz = target_z - mob->pos_z;
@@ -385,9 +387,9 @@ static void pick_wander_target(proto_mob_t *mob)
 }
 
 static int find_nearest_player(const proto_mob_t *mob,
-                                const proto_entity_player_view_t *players,
-                                int player_count,
-                                double *dist_out)
+                               const proto_entity_player_view_t *players,
+                               int player_count,
+                               double *dist_out)
 {
     int nearest = -1;
     double nearest_dist = PROTO_MOB_DETECTION_RANGE + 1.0;
@@ -413,10 +415,10 @@ static int find_nearest_player(const proto_mob_t *mob,
 }
 
 static void ai_tick_mob(proto_mob_t *mob,
-                         uint64_t now_ms,
-                         const proto_entity_player_view_t *players,
-                         int player_count,
-                         proto_entity_damage_fn damage_fn)
+                        uint64_t now_ms,
+                        const proto_entity_player_view_t *players,
+                        int player_count,
+                        proto_entity_damage_fn damage_fn)
 {
     if (!mob->active)
     {
@@ -505,8 +507,8 @@ static void ai_tick_mob(proto_mob_t *mob,
 }
 
 static void try_spawn_mob(uint64_t now_ms,
-                           const proto_entity_player_view_t *players,
-                           int player_count)
+                          const proto_entity_player_view_t *players,
+                          int player_count)
 {
     if (now_ms - s_last_spawn_attempt_ms < PROTO_MOB_SPAWN_INTERVAL_MS)
     {
@@ -556,7 +558,7 @@ static void try_spawn_mob(uint64_t now_ms,
         double spawn_z = (double)bz + 0.5;
 
         int32_t id = proto_entity_spawn_mob(PROTO_ENTITY_TYPE_ZOMBIE,
-                                             spawn_x, spawn_y, spawn_z);
+                                            spawn_x, spawn_y, spawn_z);
         if (id != 0)
         {
             ESP_LOGI(PROTO_ENTITY_TAG,
@@ -567,9 +569,9 @@ static void try_spawn_mob(uint64_t now_ms,
 }
 
 void proto_entity_tick(uint64_t now_ms,
-                        const proto_entity_player_view_t *players,
-                        int player_count,
-                        proto_entity_damage_fn damage_fn)
+                       const proto_entity_player_view_t *players,
+                       int player_count,
+                       proto_entity_damage_fn damage_fn)
 {
     if (!s_entity_initialized)
     {
@@ -593,7 +595,7 @@ void proto_entity_tick(uint64_t now_ms,
 }
 
 static bool write_mob_spawn_packet(proto_writer_t *writer,
-                                    const proto_mob_t *mob)
+                                   const proto_mob_t *mob)
 {
     uint8_t yaw_byte = (uint8_t)((int)(mob->yaw * 256.0f / 360.0f) & 0xFF);
     uint8_t pitch_byte = (uint8_t)((int)(mob->pitch * 256.0f / 360.0f) & 0xFF);
@@ -618,9 +620,9 @@ static bool write_mob_spawn_packet(proto_writer_t *writer,
 }
 
 void proto_entity_broadcast_updates(int player_socket_fds[],
-                                     int player_count,
-                                     proto_entity_send_fn send_fn,
-                                     void *context)
+                                    int player_count,
+                                    proto_entity_send_fn send_fn,
+                                    void *context)
 {
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_entity_buffer, sizeof(s_proto_entity_buffer));

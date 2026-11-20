@@ -100,7 +100,8 @@ world_biome_t world_query_biome(const world_config_t *config, int32_t x, int32_t
 
 #define ANCHOR_CACHE_SIZE 64
 
-typedef struct {
+typedef struct
+{
     uint32_t seed;
     int32_t ax;
     int32_t az;
@@ -114,7 +115,7 @@ static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, in
 {
     uint32_t cache_idx = (((uint32_t)ax * 73856093u) ^ ((uint32_t)az * 19349663u)) & (ANCHOR_CACHE_SIZE - 1);
     anchor_cache_entry_t *entry = &s_anchor_cache[cache_idx];
-    
+
     if (entry->valid && entry->seed == config->seed && entry->ax == ax && entry->az == az)
     {
         return entry->height;

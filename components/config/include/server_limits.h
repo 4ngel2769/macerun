@@ -11,6 +11,13 @@
 #define SERVER_NET_TASK_PRIORITY 19
 #define SERVER_TICK_MS 25
 
+/* Inbound cap. Deliberate: every serverbound packet in normal 1.16.5 play is
+ * well under 1 KB (the only unbounded ones are plugin messages, which this MVP
+ * does not implement). A client declaring more is disconnected as
+ * PROTO_EXTRACT_TOO_LARGE, not as malformed framing.
+ * The RX stream buffer must hold one max packet plus its VarInt length prefix;
+ * net_server.c static_asserts that. The remaining slack absorbs pipelined
+ * packets that arrive in one recv(). */
 #define SERVER_RX_STREAM_BUFFER 4096
 #define SERVER_MAX_INBOUND_PACKET_SIZE 1536
 #define SERVER_MAX_OUTBOUND_PACKET_SIZE (64 * 1024)

@@ -29,6 +29,12 @@
  * the other players (chunk floods, laggy uploads, malicious clients). */
 #define SERVER_RX_BUDGET_PER_TICK (24 * 1024)
 
+/* The stream buffer must be able to hold one maximum-size packet plus its
+ * VarInt length prefix, otherwise proto_extract_packet reports TOO_LARGE for a
+ * packet that would have fit. */
+_Static_assert(SERVER_RX_STREAM_BUFFER >= SERVER_MAX_INBOUND_PACKET_SIZE + PROTO_VARINT_MAX_LEN,
+               "RX stream buffer must fit one max packet plus its VarInt prefix");
+
 typedef struct
 {
     bool in_use;
@@ -53,8 +59,10 @@ static net_server_state_t s_server;
 
 static bool username_equals_ignore_case(const char *left, const char *right);
 
+/* Only applies damage here. Death is detected later in tick_survival_state by
+ * the health<=0 latch, so all death packets come from one place. */
 static void mob_damage_player_callback(int32_t target_player_entity_id,
-                                        float damage)
+                                       float damage)
 {
     for (size_t i = 0; i < SERVER_MAX_PLAYERS; i++)
     {
@@ -484,7 +492,8 @@ static void accept_new_clients(net_server_state_t *server)
 {
     while (true)
     {
-        struct sockaddr_in6 client_addr;
+        /* Listen socket is AF_INET, so the peer address is sockaddr_in too. */
+        struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
         int client_fd = accept(server->listen_fd, (struct sockaddr *)&client_addr, &client_len);
@@ -581,12 +590,20 @@ static bool try_handle_player_chat_command(net_server_state_t *server,
     }
 
     char chat_message[SERVER_MAX_CHAT_MESSAGE_LENGTH + 1];
-    if (!proto_read_string(&reader, chat_message, sizeof(chat_message)))
+    bool was_clipped = false;
+    if (!proto_read_chat_message_limited(&reader, chat_message, sizeof(chat_message), &was_clipped))
     {
         return false;
     }
 
     const char *args = NULL;
+    if (was_clipped)
+    {
+        /* Clipping can cut mid-token, so the remainder isn't a trustworthy
+         * command. Fall through: the normal chat path reports the overflow. */
+        return false;
+    }
+
     if (strncmp(chat_message, "/give ", 6) == 0)
     {
         args = chat_message + 6;
@@ -729,6 +746,15 @@ static void process_stream_packets(net_server_state_t *server,
 
         if (result == PROTO_EXTRACT_NONE)
         {
+            return;
+        }
+
+        if (result == PROTO_EXTRACT_TOO_LARGE)
+        {
+            ESP_LOGW(TAG,
+                     "inbound packet exceeds the %u byte limit, disconnecting client",
+                     (unsigned int)SERVER_MAX_INBOUND_PACKET_SIZE);
+            close_client_with_reason(server, client, "inbound packet too large");
             return;
         }
 
@@ -929,6 +955,8 @@ static void server_task(void *arg)
 
     ESP_LOGI(TAG, "listening on port %u", (unsigned int)server->config.bind_port);
 
+    /* Idempotent; ensure_world_initialized() also calls it. Called here so the first
+     * tick has entities ready without waiting on world init. */
     proto_entity_init();
 
     while (server->running)
@@ -1272,12 +1300,12 @@ esp_err_t net_server_start(const net_server_config_t *config)
     s_server.config = *config;
 
     BaseType_t ok = xTaskCreatePinnedToCore(server_task,
-                                "net_server",
-                                SERVER_NET_TASK_STACK,
-                                &s_server,
-                                SERVER_NET_TASK_PRIORITY,
-                                &s_server.task,
-                                1);
+                                            "net_server",
+                                            SERVER_NET_TASK_STACK,
+                                            &s_server,
+                                            SERVER_NET_TASK_PRIORITY,
+                                            &s_server.task,
+                                            1);
     if (ok != pdPASS)
     {
         memset(&s_server, 0, sizeof(s_server));

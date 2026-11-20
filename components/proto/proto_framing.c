@@ -73,7 +73,7 @@ bool proto_read_varint(proto_reader_t *reader, int32_t *value)
         }
 
         shift += 7;
-        if (shift >= 35)
+        if (shift >= (PROTO_VARINT_MAX_LEN * 7))
         {
             return false;
         }
@@ -212,7 +212,7 @@ bool proto_peek_varint(const uint8_t *data, size_t data_length, int32_t *value, 
     int32_t result = 0;
     uint8_t shift = 0;
 
-    for (size_t i = 0; i < data_length && i < 5; i++)
+    for (size_t i = 0; i < data_length && i < PROTO_VARINT_MAX_LEN; i++)
     {
         uint8_t current = data[i];
         result |= (int32_t)(current & 0x7F) << shift;
@@ -241,16 +241,21 @@ proto_extract_result_t proto_extract_packet(uint8_t *stream,
 
     if (!proto_peek_varint(stream, *stream_length, &body_length, &varint_len))
     {
-        if (*stream_length >= 5)
+        if (*stream_length >= PROTO_VARINT_MAX_LEN)
         {
             return PROTO_EXTRACT_ERROR;
         }
         return PROTO_EXTRACT_NONE;
     }
 
-    if (body_length < 0 || (size_t)body_length > packet_capacity)
+    if (body_length < 0)
     {
         return PROTO_EXTRACT_ERROR;
+    }
+
+    if ((size_t)body_length > packet_capacity)
+    {
+        return PROTO_EXTRACT_TOO_LARGE;
     }
 
     size_t total = varint_len + (size_t)body_length;

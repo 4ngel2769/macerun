@@ -48,23 +48,23 @@ static const proto_profile_t PROFILE_754 = {
     .s2c_play_set_slot = 0x15,
     .s2c_play_update_health = 0x49,
 
-    .s2c_play_player_info      = 0x32,
-    .s2c_play_spawn_player     = 0x04,
-    .s2c_play_entity_position  = 0x27,
-    .s2c_play_entity_pos_rot   = 0x28,
-    .s2c_play_entity_rotation  = 0x29,
+    .s2c_play_player_info = 0x32,
+    .s2c_play_spawn_player = 0x04,
+    .s2c_play_entity_position = 0x27,
+    .s2c_play_entity_pos_rot = 0x28,
+    .s2c_play_entity_rotation = 0x29,
     .s2c_play_entity_head_look = 0x3A,
     .s2c_play_destroy_entities = 0x36,
-    .s2c_play_ack_dig          = 0x07,
-    .s2c_play_open_window      = 0x2D,
+    .s2c_play_ack_dig = 0x07,
+    .s2c_play_open_window = 0x2D,
     /* 754 clientbound Window Items is 0x13; 0x14 is Craft Progress Bar. */
-    .s2c_play_window_items     = 0x13,
-    .s2c_play_close_window     = 0x12,
+    .s2c_play_window_items = 0x13,
+    .s2c_play_close_window = 0x12,
     /* 754 clientbound Respawn is 0x39. */
-    .s2c_play_respawn          = 0x39,
+    .s2c_play_respawn = 0x39,
     /* 754 Spawn Mob (Spawn Entity Living) is 0x02; 0x3F is Face Player. */
-    .s2c_play_spawn_mob        = 0x02,
-    .s2c_play_entity_velocity  = 0x46,
+    .s2c_play_spawn_mob = 0x02,
+    .s2c_play_entity_velocity = 0x46,
 
     .supports_light_trust_edges = true,
 };

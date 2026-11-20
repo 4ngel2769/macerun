@@ -22,8 +22,14 @@ typedef enum
 {
     PROTO_EXTRACT_NONE = 0,
     PROTO_EXTRACT_OK = 1,
+    /* Framing is well-formed but the declared body exceeds packet_capacity. */
+    PROTO_EXTRACT_TOO_LARGE = -2,
     PROTO_EXTRACT_ERROR = -1,
 } proto_extract_result_t;
+
+/* A VarInt is at most 5 bytes for a 32-bit value. Single source of truth for
+ * proto_read_varint, proto_peek_varint, and the framing error path. */
+#define PROTO_VARINT_MAX_LEN 5
 
 void proto_reader_init(proto_reader_t *reader, const uint8_t *data, size_t length);
 bool proto_read_u8(proto_reader_t *reader, uint8_t *value);

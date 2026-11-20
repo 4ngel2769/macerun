@@ -15,7 +15,8 @@
 #define PROTO_CHEST_WINDOW_ID 1
 #define PROTO_MAX_CHEST_INSTANCES 16
 
-typedef struct {
+typedef struct
+{
     int32_t x;
     int32_t y;
     int32_t z;
@@ -33,8 +34,8 @@ void proto_container_free(int32_t x, int32_t y, int32_t z);
 int16_t proto_container_window_slot_to_player_slot(int16_t window_slot);
 bool proto_container_window_slot_is_chest(int16_t window_slot);
 uint16_t *proto_container_resolve_item_ptr(proto_container_state_t *container,
-                                            uint16_t *player_inventory,
-                                            int16_t window_slot);
+                                           uint16_t *player_inventory,
+                                           int16_t window_slot);
 uint8_t *proto_container_resolve_count_ptr(proto_container_state_t *container,
-                                            uint8_t *player_counts,
-                                            int16_t window_slot);
+                                           uint8_t *player_counts,
+                                           int16_t window_slot);

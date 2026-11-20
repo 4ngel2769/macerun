@@ -35,6 +35,9 @@
 #define PROTO_STARVATION_DAMAGE_INTERVAL_MS 3000ULL
 #define PROTO_VOID_DAMAGE_INTERVAL_MS 600ULL
 #define PROTO_ATTACK_COOLDOWN_MS 500ULL
+/* NVS commit interval for player position/health. Bounds flash wear and net-task
+ * jitter; a crash or power loss costs at most this much movement. */
+#define PROTO_DATA_PERSIST_INTERVAL_MS 30000ULL
 
 typedef enum
 {
@@ -909,8 +912,8 @@ static uint32_t username_hash_djb2(const char *username)
 }
 
 static bool inventory_nvs_key_for_username(const char *username,
-                                            char *key_out,
-                                            size_t key_out_size)
+                                           char *key_out,
+                                           size_t key_out_size)
 {
     if (username == NULL || username[0] == '\0' || key_out == NULL || key_out_size < 13)
     {
@@ -926,8 +929,8 @@ static bool inventory_nvs_key_for_username(const char *username,
 }
 
 static bool player_data_nvs_key_for_username(const char *username,
-                                            char *key_out,
-                                            size_t key_out_size)
+                                             char *key_out,
+                                             size_t key_out_size)
 {
     if (username == NULL || username[0] == '\0' || key_out == NULL || key_out_size < 13)
     {
@@ -1054,7 +1057,7 @@ static bool serialize_player_data_to_buffer(const proto_connection_t *connection
     blob.health = connection->health;
     blob.food_level = connection->food_level;
     blob.food_saturation = connection->food_saturation;
-    
+
     memcpy(blob.inventory_item_ids, connection->inventory_item_ids, sizeof(blob.inventory_item_ids));
     memcpy(blob.inventory_item_counts, connection->inventory_item_counts, sizeof(blob.inventory_item_counts));
     blob.selected_hotbar_slot = connection->selected_hotbar_slot;
@@ -1083,7 +1086,7 @@ static bool deserialize_player_data_from_buffer(proto_connection_t *connection, 
     connection->health = blob.health;
     connection->food_level = blob.food_level;
     connection->food_saturation = blob.food_saturation;
-    
+
     memcpy(connection->inventory_item_ids, blob.inventory_item_ids, sizeof(connection->inventory_item_ids));
     memcpy(connection->inventory_item_counts, blob.inventory_item_counts, sizeof(connection->inventory_item_counts));
     connection->selected_hotbar_slot = blob.selected_hotbar_slot;
@@ -1295,8 +1298,8 @@ static bool write_slot_to_writer(proto_writer_t *writer, uint16_t item_id, uint8
 }
 
 static bool send_open_window_packet(int socket_fd,
-                                     proto_send_callback_t send_fn,
-                                     void *send_context)
+                                    proto_send_callback_t send_fn,
+                                    void *send_context)
 {
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
@@ -1318,10 +1321,10 @@ static bool send_open_window_packet(int socket_fd,
 }
 
 static bool send_window_items_packet(int socket_fd,
-                                      const proto_container_state_t *container,
-                                      const proto_connection_t *connection,
-                                      proto_send_callback_t send_fn,
-                                      void *send_context)
+                                     const proto_container_state_t *container,
+                                     const proto_connection_t *connection,
+                                     proto_send_callback_t send_fn,
+                                     void *send_context)
 {
     if (container == NULL || connection == NULL)
     {
@@ -1357,8 +1360,8 @@ static bool send_window_items_packet(int socket_fd,
     for (uint16_t player_slot = 9; player_slot <= 44; player_slot++)
     {
         if (!write_slot_to_writer(&writer,
-                                   connection->inventory_item_ids[player_slot],
-                                   connection->inventory_item_counts[player_slot]))
+                                  connection->inventory_item_ids[player_slot],
+                                  connection->inventory_item_counts[player_slot]))
         {
             return false;
         }
@@ -1377,11 +1380,11 @@ static bool send_window_items_packet(int socket_fd,
 }
 
 static void handle_chest_click_window(proto_connection_t *connection,
-                                       int socket_fd,
-                                       uint16_t slot_raw,
-                                       uint8_t button,
-                                       proto_send_callback_t send_fn,
-                                       void *send_context)
+                                      int socket_fd,
+                                      uint16_t slot_raw,
+                                      uint8_t button,
+                                      proto_send_callback_t send_fn,
+                                      void *send_context)
 {
     if (connection->open_container_window_id != PROTO_CHEST_WINDOW_ID)
     {
@@ -1579,8 +1582,8 @@ static void handle_chest_click_window(proto_connection_t *connection,
 }
 
 static bool send_crafting_table_open_packet(int socket_fd,
-                                             proto_send_callback_t send_fn,
-                                             void *send_context)
+                                            proto_send_callback_t send_fn,
+                                            void *send_context)
 {
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
@@ -1602,9 +1605,9 @@ static bool send_crafting_table_open_packet(int socket_fd,
 }
 
 static bool send_crafting_table_window_items(int socket_fd,
-                                              const proto_connection_t *connection,
-                                              proto_send_callback_t send_fn,
-                                              void *send_context)
+                                             const proto_connection_t *connection,
+                                             proto_send_callback_t send_fn,
+                                             void *send_context)
 {
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
@@ -1635,8 +1638,8 @@ static bool send_crafting_table_window_items(int socket_fd,
     for (uint8_t i = 0; i < 9; i++)
     {
         if (!write_slot_to_writer(&writer,
-                                   connection->crafting_grid_item_ids[i],
-                                   connection->crafting_grid_item_counts[i]))
+                                  connection->crafting_grid_item_ids[i],
+                                  connection->crafting_grid_item_counts[i]))
         {
             return false;
         }
@@ -1647,8 +1650,8 @@ static bool send_crafting_table_window_items(int socket_fd,
     for (uint16_t player_slot = 9; player_slot <= 44; player_slot++)
     {
         if (!write_slot_to_writer(&writer,
-                                   connection->inventory_item_ids[player_slot],
-                                   connection->inventory_item_counts[player_slot]))
+                                  connection->inventory_item_ids[player_slot],
+                                  connection->inventory_item_counts[player_slot]))
         {
             return false;
         }
@@ -1667,9 +1670,9 @@ static bool send_crafting_table_window_items(int socket_fd,
 }
 
 static bool sync_crafting_table_output_slot(int socket_fd,
-                                             const proto_connection_t *connection,
-                                             proto_send_callback_t send_fn,
-                                             void *send_context)
+                                            const proto_connection_t *connection,
+                                            proto_send_callback_t send_fn,
+                                            void *send_context)
 {
     proto_table_crafting_match_t match = proto_evaluate_table_crafting(connection->crafting_grid_item_ids);
     return send_set_slot_packet(socket_fd,
@@ -1682,10 +1685,10 @@ static bool sync_crafting_table_output_slot(int socket_fd,
 }
 
 static bool sync_crafting_table_grid_slot(int socket_fd,
-                                           const proto_connection_t *connection,
-                                           uint8_t grid_index,
-                                           proto_send_callback_t send_fn,
-                                           void *send_context)
+                                          const proto_connection_t *connection,
+                                          uint8_t grid_index,
+                                          proto_send_callback_t send_fn,
+                                          void *send_context)
 {
     return send_set_slot_packet(socket_fd,
                                 PROTO_CRAFTING_TABLE_WINDOW_ID,
@@ -1697,11 +1700,11 @@ static bool sync_crafting_table_grid_slot(int socket_fd,
 }
 
 static void handle_crafting_table_click(proto_connection_t *connection,
-                                         int socket_fd,
-                                         uint16_t slot_raw,
-                                         uint8_t button,
-                                         proto_send_callback_t send_fn,
-                                         void *send_context)
+                                        int socket_fd,
+                                        uint16_t slot_raw,
+                                        uint8_t button,
+                                        proto_send_callback_t send_fn,
+                                        void *send_context)
 {
     if (connection->open_container_window_id != PROTO_CRAFTING_TABLE_WINDOW_ID)
     {
@@ -1875,8 +1878,8 @@ static void handle_crafting_table_click(proto_connection_t *connection,
         }
 
         proto_consume_table_ingredients(connection->crafting_grid_item_ids,
-                                         connection->crafting_grid_item_counts,
-                                         match.consume_mask);
+                                        connection->crafting_grid_item_counts,
+                                        match.consume_mask);
 
         if (!send_cursor_update(socket_fd, connection, send_fn, send_context) ||
             !sync_crafting_table_output_slot(socket_fd, connection, send_fn, send_context))
@@ -2007,12 +2010,12 @@ static void handle_crafting_table_click(proto_connection_t *connection,
         if (changed)
         {
             if (!send_set_slot_packet(socket_fd,
-                                       PROTO_CRAFTING_TABLE_WINDOW_ID,
-                                       window_slot,
-                                       *slot_id,
-                                       *slot_count,
-                                       send_fn,
-                                       send_context))
+                                      PROTO_CRAFTING_TABLE_WINDOW_ID,
+                                      window_slot,
+                                      *slot_id,
+                                      *slot_count,
+                                      send_fn,
+                                      send_context))
             {
                 connection->close_requested = true;
                 return;
@@ -2717,8 +2720,8 @@ static bool encode_chunk_sections(int32_t chunk_x,
             int32_t world_z = (chunk_z << 4) + local_z;
 
             uint8_t palette_index = world_block_to_palette_index(query_block_id(world_x,
-                                                                                 world_y,
-                                                                                 world_z));
+                                                                                world_y,
+                                                                                world_z));
             palette_indices[block_index] = palette_index;
             if (palette_index != 0)
             {
@@ -3747,6 +3750,7 @@ static void initialize_survival_state(proto_connection_t *connection, uint64_t n
     connection->next_health_regen_ms = now_ms + PROTO_HEALTH_REGEN_INTERVAL_MS;
     connection->next_starvation_damage_ms = now_ms + PROTO_STARVATION_DAMAGE_INTERVAL_MS;
     connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
+    connection->next_data_persist_ms = now_ms + PROTO_DATA_PERSIST_INTERVAL_MS;
 }
 
 static bool is_chunk_tracked(const proto_connection_t *connection, int32_t chunk_x, int32_t chunk_z)
@@ -4164,10 +4168,14 @@ static void handle_play_keepalive(proto_connection_t *connection,
     connection->next_keepalive_ms = now_ms + PROTO_KEEPALIVE_INTERVAL_MS;
 }
 
-static bool read_chat_message_limited(proto_reader_t *reader,
-                                      char *out,
-                                      size_t out_size,
-                                      bool *was_clipped)
+/* Reads a length-prefixed chat string, clipping to out_size rather than failing.
+ * Single parser for the play-chat packet: try_handle_player_chat_command() in
+ * net_server.c uses this too, so a long /give command is clipped consistently
+ * instead of being rejected there and clipped here. */
+bool proto_read_chat_message_limited(proto_reader_t *reader,
+                                     char *out,
+                                     size_t out_size,
+                                     bool *was_clipped)
 {
     int32_t encoded_length = 0;
     if (!proto_read_varint(reader, &encoded_length) || encoded_length < 0)
@@ -4206,7 +4214,7 @@ static void handle_play_chat(proto_connection_t *connection,
     char chat_message[SERVER_MAX_CHAT_MESSAGE_LENGTH + 1];
     bool was_clipped = false;
 
-    if (!read_chat_message_limited(reader, chat_message, sizeof(chat_message), &was_clipped))
+    if (!proto_read_chat_message_limited(reader, chat_message, sizeof(chat_message), &was_clipped))
     {
         ESP_LOGW(TAG,
                  "chat parse failed: user=%s",
@@ -4366,18 +4374,19 @@ static void handle_play_movement(proto_connection_t *connection,
     {
         connection->fall_distance += (float)(prev_y - connection->pos_y);
     }
-    
+
     if (connection->on_ground)
     {
         if (connection->fall_distance > 3.0f)
         {
             connection->health -= (connection->fall_distance - 3.0f);
-            if (connection->health < 0.0f) connection->health = 0.0f;
+            if (connection->health < 0.0f)
+                connection->health = 0.0f;
             connection->health_dirty = true;
         }
         connection->fall_distance = 0.0f;
     }
-    else if (connection->pos_y > prev_y) 
+    else if (connection->pos_y > prev_y)
     {
         connection->fall_distance = 0.0f;
     }
@@ -4496,14 +4505,14 @@ static bool adjust_position_for_face(int32_t *x, int32_t *y, int32_t *z, int32_t
 }
 
 static bool send_ack_dig(int socket_fd,
-                       int32_t world_x,
-                       int32_t world_y,
-                       int32_t world_z,
-                       int32_t status,
-                       uint8_t block_id,
-                       bool successful,
-                       proto_send_callback_t send_fn,
-                       void *send_context)
+                         int32_t world_x,
+                         int32_t world_y,
+                         int32_t world_z,
+                         int32_t status,
+                         uint8_t block_id,
+                         bool successful,
+                         proto_send_callback_t send_fn,
+                         void *send_context)
 {
     proto_writer_t writer;
     proto_writer_init(&writer, s_proto_packet_buffer, sizeof(s_proto_packet_buffer));
@@ -5361,9 +5370,9 @@ static void tick_survival_state(proto_connection_t *connection,
         health_changed = true;
     }
 
-    if (connection->health <= 0.0f && now_ms >= connection->next_void_damage_ms)
+    if (connection->health <= 0.0f && !connection->dead)
     {
-        connection->health = 0.0f;
+        connection->dead = true;
         health_changed = true;
 
         ESP_LOGW(TAG,
@@ -5376,8 +5385,6 @@ static void tick_survival_state(proto_connection_t *connection,
                      "death health update send failed: user=%s",
                      connection->username[0] != '\0' ? connection->username : "(unknown)");
         }
-
-        connection->next_void_damage_ms = now_ms + PROTO_VOID_DAMAGE_INTERVAL_MS;
     }
 
     if (!health_changed)
@@ -5595,8 +5602,15 @@ void proto_tick_connection(proto_connection_t *connection,
         connection->inventory_dirty = false;
     }
 
-    if (persist_player_data_to_nvs(connection))
+    /* Position/health drift continuously, so this can't be dirty-flagged the way
+     * inventory can. Commit on an interval instead: an NVS commit is an erase+write
+     * and costs more than a 25 ms tick, so doing it every tick (40/s/player) burned
+     * flash and jittered the net task that owns everyone's keep-alives.
+     * close_client_with_reason() still persists on a clean disconnect. */
+    if (now_ms >= connection->next_data_persist_ms)
     {
+        connection->next_data_persist_ms = now_ms + PROTO_DATA_PERSIST_INTERVAL_MS;
+        persist_player_data_to_nvs(connection);
     }
 }
 
@@ -5669,9 +5683,9 @@ bool proto_send_respawn_packet(int socket_fd,
 }
 
 bool proto_send_player_position_look_packet(int socket_fd,
-                                             const proto_connection_t *connection,
-                                             proto_send_callback_t send_fn,
-                                             void *send_context)
+                                            const proto_connection_t *connection,
+                                            proto_send_callback_t send_fn,
+                                            void *send_context)
 {
     return send_player_position_look_packet(socket_fd, connection, send_fn, send_context);
 }
@@ -5795,14 +5809,15 @@ bool proto_give_item(proto_connection_t *connection,
 }
 
 static void handle_player_respawn(proto_connection_t *connection,
-                                   int socket_fd,
-                                   proto_send_callback_t send_fn,
-                                   void *send_context)
+                                  int socket_fd,
+                                  proto_send_callback_t send_fn,
+                                  void *send_context)
 {
     ensure_world_initialized();
 
     connection->health = 20.0f;
     connection->health_dirty = true;
+    connection->dead = false;
     connection->food_level = 20;
     connection->next_hunger_decay_ms = 0;
     connection->next_health_regen_ms = 0;
@@ -5832,28 +5847,6 @@ static void handle_player_respawn(proto_connection_t *connection,
              spawn_x,
              spawn_y,
              spawn_z);
-}
-
-void proto_handle_player_death(proto_connection_t *connection,
-                                int socket_fd,
-                                proto_send_callback_t send_fn,
-                                void *send_context)
-{
-    if (connection->health <= 0.0f)
-    {
-        ESP_LOGW(TAG,
-                 "player died: user=%s",
-                 connection->username[0] != '\0' ? connection->username : "(unknown)");
-
-        if (!send_update_health_packet(socket_fd, connection, send_fn, send_context))
-        {
-            ESP_LOGW(TAG,
-                     "death health update send failed: user=%s",
-                     connection->username[0] != '\0' ? connection->username : "(unknown)");
-        }
-
-        connection->next_void_damage_ms = connection->next_hunger_decay_ms;
-    }
 }
 
 static void handle_play_client_status(proto_connection_t *connection,

@@ -88,8 +88,8 @@ static bool item_matches_tag(uint16_t actual_item, uint16_t pattern_value)
 }
 
 static bool shaped_match_3x3(const uint16_t *grid_items,
-                              const proto_table_shaped_recipe_t *recipe,
-                              uint16_t *consume_mask_out)
+                             const proto_table_shaped_recipe_t *recipe,
+                             uint16_t *consume_mask_out)
 {
     uint8_t max_offset_x = 3 - recipe->width;
     uint8_t max_offset_y = 3 - recipe->height;

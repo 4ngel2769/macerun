@@ -75,7 +75,7 @@ typedef struct
 } proto_entity_player_view_t;
 
 typedef void (*proto_entity_damage_fn)(int32_t target_player_entity_id,
-                                        float damage);
+                                       float damage);
 
 void proto_entity_init(void);
 

@@ -83,8 +83,8 @@ bool proto_container_window_slot_is_chest(int16_t window_slot)
 }
 
 uint16_t *proto_container_resolve_item_ptr(proto_container_state_t *container,
-                                            uint16_t *player_inventory,
-                                            int16_t window_slot)
+                                           uint16_t *player_inventory,
+                                           int16_t window_slot)
 {
     if (container != NULL && proto_container_window_slot_is_chest(window_slot))
     {
@@ -99,8 +99,8 @@ uint16_t *proto_container_resolve_item_ptr(proto_container_state_t *container,
 }
 
 uint8_t *proto_container_resolve_count_ptr(proto_container_state_t *container,
-                                            uint8_t *player_counts,
-                                            int16_t window_slot)
+                                           uint8_t *player_counts,
+                                           int16_t window_slot)
 {
     if (container != NULL && proto_container_window_slot_is_chest(window_slot))
     {

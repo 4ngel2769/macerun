@@ -35,7 +35,10 @@ typedef struct
     bool chunk_stream_initialized : 1;
     bool has_previous_chunk_center : 1;
     bool inventory_dirty : 1;
-    
+    /* Latched once health hits 0, cleared on respawn. Keeps death handling to
+     * exactly one send instead of re-firing off an unrelated damage timer. */
+    bool dead : 1;
+
     int32_t entity_id;
     int64_t uuid_most;
     int64_t uuid_least;
@@ -62,6 +65,7 @@ typedef struct
     uint64_t next_health_regen_ms;
     uint64_t next_starvation_damage_ms;
     uint64_t next_void_damage_ms;
+    uint64_t next_data_persist_ms;
     int32_t chunk_center_x;
     int32_t chunk_center_z;
     int32_t previous_chunk_center_x;
@@ -136,9 +140,9 @@ bool proto_build_chat_packet(const char *message_text,
                              size_t *framed_packet_length);
 
 bool proto_send_player_presence(int socket_fd,
-                                 const proto_connection_t *player,
-                                 proto_send_callback_t send_fn,
-                                 void *send_context);
+                                const proto_connection_t *player,
+                                proto_send_callback_t send_fn,
+                                void *send_context);
 
 bool proto_send_player_remove(int socket_fd,
                               const proto_connection_t *player,
@@ -167,9 +171,9 @@ bool proto_send_respawn_packet(int socket_fd,
                                void *send_context);
 
 bool proto_send_player_position_look_packet(int socket_fd,
-                                             const proto_connection_t *connection,
-                                             proto_send_callback_t send_fn,
-                                             void *send_context);
+                                            const proto_connection_t *connection,
+                                            proto_send_callback_t send_fn,
+                                            void *send_context);
 
 bool proto_resolve_item_name(const char *item_name, uint16_t *item_id_out);
 
@@ -181,23 +185,14 @@ bool proto_give_item(proto_connection_t *connection,
                      void *send_context,
                      uint16_t *granted_amount_out);
 
-void proto_handle_player_respawn(proto_connection_t *connection,
-                                 int socket_fd,
-                                 proto_send_callback_t send_fn,
-                                 void *send_context);
-
-void proto_handle_player_death(proto_connection_t *connection,
-                                int socket_fd,
-                                proto_send_callback_t send_fn,
-                                void *send_context);
-
-void proto_handle_client_status(proto_connection_t *connection,
-                                proto_reader_t *reader,
-                                int socket_fd,
-                                proto_send_callback_t send_fn,
-                                void *send_context);
-
 bool persist_player_data_to_nvs(const proto_connection_t *connection);
+
+/* Reads a length-prefixed chat string, clipping to out_size instead of failing.
+ * Shared by the broadcast path and the /give command interceptor so both agree. */
+bool proto_read_chat_message_limited(proto_reader_t *reader,
+                                     char *out,
+                                     size_t out_size,
+                                     bool *was_clipped);
 
 int32_t proto_next_entity_id(void);
 
