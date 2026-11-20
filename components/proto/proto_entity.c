@@ -420,8 +420,9 @@ static int find_nearest_player(const proto_mob_t *mob,
     for (int i = 0; i < player_count; i++)
     {
         double dx = players[i].pos_x - mob->pos_x;
+        double dy = players[i].pos_y - mob->pos_y;
         double dz = players[i].pos_z - mob->pos_z;
-        double dist = sqrt(dx * dx + dz * dz);
+        double dist = sqrt(dx * dx + dy * dy + dz * dz);
 
         if (dist < nearest_dist)
         {

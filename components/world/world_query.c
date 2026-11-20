@@ -1,5 +1,6 @@
 #include "world_query.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -7,7 +8,6 @@
 #include "server_limits.h"
 
 #define WORLD_TREE_CELL_SIZE 8
-#define WORLD_DETAIL_STEP 16
 
 static int32_t floor_div(int32_t value, int32_t divisor)
 {
@@ -43,17 +43,73 @@ static int32_t abs_i32(int32_t value)
     return value < 0 ? -value : value;
 }
 
-static int32_t interpolate_bilinear(int32_t h00,
-                                    int32_t h10,
-                                    int32_t h01,
-                                    int32_t h11,
-                                    int32_t tx,
-                                    int32_t tz,
-                                    int32_t step)
+/* --- Gradient (Perlin) noise ------------------------------------------------ */
+/* Smooth, deterministic 2D noise. hash_xz seeds a fixed set of gradients at
+ * integer lattice points; fade() makes the interpolation continuous in both
+ * value and slope, avoiding the square "grid" artefacts of value noise. */
+static float noise_fade(float t)
 {
-    int32_t top = h00 * (step - tx) + h10 * tx;
-    int32_t bottom = h01 * (step - tx) + h11 * tx;
-    return (top * (step - tz) + bottom * tz) / (step * step);
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+static float noise_lerp(float a, float b, float t)
+{
+    return a + t * (b - a);
+}
+
+static float perlin_gradient(uint32_t seed, int32_t x, int32_t z, float dx, float dz)
+{
+    switch (hash_xz(seed, x, z, 0x5EED1234u) & 7u)
+    {
+    case 0: return  dx + dz;
+    case 1: return -dx + dz;
+    case 2: return  dx - dz;
+    case 3: return -dx - dz;
+    case 4: return  dx;
+    case 5: return -dx;
+    case 6: return  dz;
+    default: return -dz;
+    }
+}
+
+static float perlin2d(uint32_t seed, float x, float z)
+{
+    int32_t xi = (int32_t)floorf(x);
+    int32_t zi = (int32_t)floorf(z);
+    float dx = x - (float)xi;
+    float dz = z - (float)zi;
+    float u = noise_fade(dx);
+    float v = noise_fade(dz);
+
+    float n00 = perlin_gradient(seed, xi,     zi,     dx,        dz);
+    float n10 = perlin_gradient(seed, xi + 1, zi,     dx - 1.0f, dz);
+    float n01 = perlin_gradient(seed, xi,     zi + 1, dx,        dz - 1.0f);
+    float n11 = perlin_gradient(seed, xi + 1, zi + 1, dx - 1.0f, dz - 1.0f);
+
+    /* ~0.7 keeps the result in roughly [-1, 1] for the diagonal gradients. */
+    return noise_lerp(noise_lerp(n00, n10, u),
+                      noise_lerp(n01, n11, u), v) * 0.7f;
+}
+
+/* Fractal Brownian motion: stack octaves at doubling frequency / halving
+ * amplitude so terrain has both broad continent shapes and small detail. */
+static float fbm2d(uint32_t seed, float x, float z, int octaves)
+{
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+
+    for (int i = 0; i < octaves; i++)
+    {
+        sum += perlin2d(seed + (uint32_t)i * 0x9E3779B9u,
+                        x * frequency, z * frequency) * amplitude;
+        norm += amplitude;
+        amplitude *= 0.5f;
+        frequency *= 2.0f;
+    }
+
+    return sum / norm;
 }
 
 static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value)
@@ -81,144 +137,78 @@ void world_config_set_defaults(world_config_t *config, uint32_t seed)
 
 world_biome_t world_query_biome(const world_config_t *config, int32_t x, int32_t z)
 {
-    int32_t cell_x = floor_div(x, config->biome_tile_size);
-    int32_t cell_z = floor_div(z, config->biome_tile_size);
-    uint32_t h = hash_xz(config->seed, cell_x, cell_z, 0xB16B00B5u);
+    /* Two smooth climate fields instead of one hash per 128-block tile:
+     * temperature decides cold/hot, moisture decides forest/desert. This
+     * produces contiguous, plausible biome regions with soft boundaries. */
+    float temperature = fbm2d(config->seed ^ 0x0A11CEu,
+                              x * 0.0035f, z * 0.0035f, 3);
+    float moisture = fbm2d(config->seed ^ 0x0B0B1Eu,
+                           x * 0.0045f, z * 0.0045f, 3);
 
-    switch (h & 0x3u)
+    if (temperature < -0.28f)
     {
-    case 0:
-        return WORLD_BIOME_PLAINS;
-    case 1:
-        return WORLD_BIOME_FOREST;
-    case 2:
-        return WORLD_BIOME_DESERT;
-    default:
         return WORLD_BIOME_SNOW;
     }
+    if (temperature > 0.18f && moisture < 0.05f)
+    {
+        return WORLD_BIOME_DESERT;
+    }
+    if (moisture > 0.12f)
+    {
+        return WORLD_BIOME_FOREST;
+    }
+    return WORLD_BIOME_PLAINS;
 }
 
-#define ANCHOR_CACHE_SIZE 64
-
-typedef struct
+/* Terrain height from layered Perlin noise: a broad octave sets continent
+ * scale hills, a detail octave adds gentle local variation. Biome sets the
+ * base elevation and relief amplitude so deserts stay flatter and snowy
+ * highlands rise above the surrounding land. */
+static int16_t sample_surface_height(const world_config_t *config, int32_t x, int32_t z)
 {
-    uint32_t seed;
-    int32_t ax;
-    int32_t az;
-    int16_t height;
-    bool valid;
-} anchor_cache_entry_t;
-
-static anchor_cache_entry_t s_anchor_cache[ANCHOR_CACHE_SIZE];
-
-static int16_t sample_anchor_height(const world_config_t *config, int32_t ax, int32_t az)
-{
-    uint32_t cache_idx = (((uint32_t)ax * 73856093u) ^ ((uint32_t)az * 19349663u)) & (ANCHOR_CACHE_SIZE - 1);
-    anchor_cache_entry_t *entry = &s_anchor_cache[cache_idx];
-
-    if (entry->valid && entry->seed == config->seed && entry->ax == ax && entry->az == az)
-    {
-        return entry->height;
-    }
-
-    world_biome_t biome = world_query_biome(config, ax, az);
-    uint32_t h = hash_xz(config->seed, ax, az, 0xC001D00Du);
+    world_biome_t biome = world_query_biome(config, x, z);
 
     int base = config->sea_level;
-    int amplitude = 6;
-    int factors = 4;
+    float amplitude = 6.0f;
 
     switch (biome)
     {
     case WORLD_BIOME_PLAINS:
         base += 3;
-        amplitude = 5;
-        factors = 4;
+        amplitude = 5.0f;
         break;
     case WORLD_BIOME_FOREST:
         base += 4;
-        amplitude = 9;
-        factors = 4;
+        amplitude = 8.0f;
         break;
     case WORLD_BIOME_DESERT:
         base += 2;
-        amplitude = 4;
-        factors = 3;
+        amplitude = 4.0f;
         break;
     case WORLD_BIOME_SNOW:
         base += 6;
-        amplitude = 11;
-        factors = 3;
+        amplitude = 11.0f;
         break;
     }
 
-    int sum = 0;
-    for (int i = 0; i < factors; i++)
-    {
-        sum += (int)((h >> (i * 4)) & 0x0Fu);
-    }
+    float continent = fbm2d(config->seed ^ 0xC0FFEEu,
+                            x * 0.010f, z * 0.010f, 4);
+    float detail = fbm2d(config->seed ^ 0xD00D00u,
+                         x * 0.045f, z * 0.045f, 2);
 
-    int max_sum = factors * 15;
-    int delta = ((sum * (2 * amplitude + 1)) / max_sum) - amplitude;
-
-    int32_t detail_cell_x = floor_div(ax, WORLD_DETAIL_STEP);
-    int32_t detail_cell_z = floor_div(az, WORLD_DETAIL_STEP);
-    uint32_t detail_hash = hash_xz(config->seed ^ 0xA53C1E2Du,
-                                   detail_cell_x,
-                                   detail_cell_z,
-                                   0x9E3779B9u);
-    int32_t detail = ((int32_t)(detail_hash & 0x7u)) - 3;
-
-    int32_t ridge_hash = (int32_t)((detail_hash >> 8) & 0x0Fu);
-    if (ridge_hash < 3)
-    {
-        detail += 2;
-    }
-
-    delta += detail;
-
-    int height = base + delta;
+    int height = base + (int)(continent * amplitude) + (int)(detail * 2.0f);
 
     if (biome == WORLD_BIOME_DESERT && height < config->sea_level)
     {
         height = config->sea_level;
     }
 
-    int16_t final_height = clamp_i16(height, config->min_y + 1, config->max_y);
-
-    /* Publish payload first and flip `valid` last so a reader that races with
-     * a refilled slot never observes valid=true with stale coordinates. */
-    entry->seed = config->seed;
-    entry->ax = ax;
-    entry->az = az;
-    entry->height = final_height;
-    entry->valid = true;
-
-    return final_height;
+    return clamp_i16(height, config->min_y + 1, config->max_y);
 }
 
 int16_t world_query_surface_y(const world_config_t *config, int32_t x, int32_t z)
 {
-    int32_t step = config->anchor_step;
-    int32_t cell_x = floor_div(x, step);
-    int32_t cell_z = floor_div(z, step);
-
-    int32_t x0 = cell_x * step;
-    int32_t z0 = cell_z * step;
-    int32_t x1 = x0 + step;
-    int32_t z1 = z0 + step;
-
-    int16_t h00 = sample_anchor_height(config, x0, z0);
-    int16_t h10 = sample_anchor_height(config, x1, z0);
-    int16_t h01 = sample_anchor_height(config, x0, z1);
-    int16_t h11 = sample_anchor_height(config, x1, z1);
-
-    int32_t tx = x - x0;
-    int32_t tz = z - z0;
-
-    int32_t blended = interpolate_bilinear(h00, h10, h01, h11, tx, tz, step);
-
-    return clamp_i16(blended, config->min_y + 1, config->max_y);
+    return sample_surface_height(config, x, z);
 }
 
 static uint8_t biome_surface_block(world_biome_t biome)
